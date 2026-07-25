@@ -814,7 +814,7 @@ class HushiApp {
   async _setupPushNotifications(){
     if(!('serviceWorker' in navigator) || !('PushManager' in window)) return; // unsupported browser, fail quietly
     try{
-      const reg = await navigator.serviceWorker.register('/sw.js');
+      const reg = await navigator.serviceWorker.register('sw.js');
       if(Notification.permission === 'denied') return;
       if(Notification.permission !== 'granted'){
         const perm = await Notification.requestPermission();
