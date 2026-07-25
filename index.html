@@ -520,6 +520,8 @@ class WakeWordListener extends Emitter {
     this._recentFinals = []; // {text, time} — rolling window so a phrase split
                               // across two separate results (e.g. said with a
                               // small pause) still gets matched together
+    this._lastActivityAt = 0;
+    this._watchdogInterval = null;
   }
 
   start(){
@@ -531,10 +533,12 @@ class WakeWordListener extends Emitter {
     this.recognition.lang = 'en-US';
     this.active = true;
     this._recentFinals = [];
+    this._lastActivityAt = Date.now();
     const doubledPhrases = this.phrases.map(p => p + ' ' + p);
     const WINDOW_MS = 6000;
 
     this.recognition.onresult = (event) => {
+      this._lastActivityAt = Date.now();
       const now = Date.now();
       let interim = '';
       for(let i = event.resultIndex; i < event.results.length; i++){
@@ -552,14 +556,34 @@ class WakeWordListener extends Emitter {
       this.emit('heard', windowText);
       if(doubledPhrases.some(doubled => windowText.includes(doubled))) this.emit('wake');
     };
-    this.recognition.onerror = (event) => { this.emit('error', event.error); };
+    this.recognition.onstart = () => { this._lastActivityAt = Date.now(); };
+    this.recognition.onerror = (event) => { this._lastActivityAt = Date.now(); this.emit('error', event.error); };
     this.recognition.onend = () => { if(this.active) this.recognition.start(); };
     this.recognition.start();
     this.emit('listening');
+
+    // Watchdog: Chrome on Android can silently stop delivering results
+    // without ever firing 'error' or 'end' — this catches that "zombie"
+    // state and forces a fresh session instead of staying stuck forever.
+    if(this._watchdogInterval) clearInterval(this._watchdogInterval);
+    this._watchdogInterval = setInterval(() => {
+      if(!this.active) return;
+      if(Date.now() - this._lastActivityAt > 12000){
+        this.emit('heard', '(no activity — restarting mic session)');
+        try { this.recognition.stop(); } catch(e) {}
+        // If stop() itself doesn't trigger onend for some reason, force it directly.
+        setTimeout(() => {
+          if(this.active && Date.now() - this._lastActivityAt > 12000){
+            try { this.recognition.start(); this._lastActivityAt = Date.now(); } catch(e) {}
+          }
+        }, 500);
+      }
+    }, 4000);
   }
 
   stop(){
     this.active = false;
+    if(this._watchdogInterval){ clearInterval(this._watchdogInterval); this._watchdogInterval = null; }
     if(this.recognition) this.recognition.stop();
   }
 }
