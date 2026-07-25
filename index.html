@@ -534,8 +534,15 @@ class WakeWordListener extends Emitter {
     this.active = true;
     this._recentFinals = [];
     this._lastActivityAt = Date.now();
-    const doubledPhrases = this.phrases.map(p => p + ' ' + p);
     const WINDOW_MS = 6000;
+
+    // Whole-word match, or the heard word STARTS WITH the phrase — this is
+    // deliberate: short names commonly get misheard as a longer, more
+    // "expected" word (e.g. "Sam" heard as "Samsung" on a Samsung phone).
+    // A prefix match still counts, since the intended word was said.
+    const countMatches = (words, phrase) => {
+      return words.filter(w => w === phrase || (phrase.length >= 3 && w.startsWith(phrase))).length;
+    };
 
     this.recognition.onresult = (event) => {
       this._lastActivityAt = Date.now();
@@ -552,33 +559,38 @@ class WakeWordListener extends Emitter {
       }
       this._recentFinals = this._recentFinals.filter(e => now - e.time < WINDOW_MS);
       const windowText = (this._recentFinals.map(e => e.text).join(' ') + ' ' + interim).trim();
+      const words = windowText.split(/\s+/).filter(Boolean);
 
       this.emit('heard', windowText);
-      if(doubledPhrases.some(doubled => windowText.includes(doubled))) this.emit('wake');
+      if(this.phrases.some(p => countMatches(words, p) >= 2)) this.emit('wake');
     };
     this.recognition.onstart = () => { this._lastActivityAt = Date.now(); };
+    this.recognition.onaudiostart = () => { this._lastActivityAt = Date.now(); this.emit('mic-live'); };
+    this.recognition.onaudioend = () => {
+      this.emit('mic-idle');
+      // The mic feed itself just died — this is a real, instant signal that
+      // something's wrong, not a guess. Restart right away, no waiting.
+      if(this.active){
+        try { this.recognition.stop(); } catch(e) {}
+      }
+    };
     this.recognition.onerror = (event) => { this._lastActivityAt = Date.now(); this.emit('error', event.error); };
     this.recognition.onend = () => { if(this.active) this.recognition.start(); };
     this.recognition.start();
     this.emit('listening');
 
-    // Watchdog: Chrome on Android can silently stop delivering results
-    // without ever firing 'error' or 'end' — this catches that "zombie"
-    // state and forces a fresh session instead of staying stuck forever.
+    // Backstop watchdog: covers the rare case where even onaudioend never
+    // fires. Short window now — a restart during real silence costs
+    // nothing, so there's no reason to wait long to recover from a stall.
     if(this._watchdogInterval) clearInterval(this._watchdogInterval);
     this._watchdogInterval = setInterval(() => {
       if(!this.active) return;
-      if(Date.now() - this._lastActivityAt > 12000){
-        this.emit('heard', '(no activity — restarting mic session)');
+      if(Date.now() - this._lastActivityAt > 4000){
+        this._lastActivityAt = Date.now();
         try { this.recognition.stop(); } catch(e) {}
-        // If stop() itself doesn't trigger onend for some reason, force it directly.
-        setTimeout(() => {
-          if(this.active && Date.now() - this._lastActivityAt > 12000){
-            try { this.recognition.start(); this._lastActivityAt = Date.now(); } catch(e) {}
-          }
-        }, 500);
+        try { this.recognition.start(); } catch(e) {}
       }
-    }, 4000);
+    }, 1500);
   }
 
   stop(){
@@ -967,7 +979,7 @@ class HushiApp {
 
   // ---------- wake word wiring ----------
   _startWake(){
-    this.wakeListener = new WakeWordListener([this.state.partnerNick, 'alo']);
+    this.wakeListener = new WakeWordListener([this.state.partnerNick, 'alo', 'allo']);
     const baseHint = `Say "${this.state.partnerNick} ${this.state.partnerNick}" or "Alo Alo" to call, hands-free.`;
     this.wakeListener.on('wake', () => {
       this._pauseWakeForCall();
@@ -977,11 +989,17 @@ class HushiApp {
     this.wakeListener.on('listening', () => {
       this.$('wake-note').textContent = baseHint + ' (listening…)';
     });
+    this.wakeListener.on('mic-live', () => {
+      this.$('wake-note').textContent = '🟢 mic live — ' + baseHint;
+    });
+    this.wakeListener.on('mic-idle', () => {
+      this.$('wake-note').textContent = '⚪ mic idle, restarting — ' + baseHint;
+    });
     this.wakeListener.on('heard', (transcript) => {
-      if(transcript) this.$('wake-note').textContent = baseHint + ` (heard: "${transcript}")`;
+      if(transcript) this.$('wake-note').textContent = `🟢 heard: "${transcript}" — ` + baseHint;
     });
     this.wakeListener.on('error', (reason) => {
-      this.$('wake-note').textContent = baseHint + ` (mic issue: ${reason} — retrying)`;
+      this.$('wake-note').textContent = `⚪ mic issue: ${reason}, retrying — ` + baseHint;
     });
     this.wakeListener.on('unsupported', () => {
       alert('Wake phrase listening needs Chrome on Android (or desktop Chrome). This browser doesn\'t support it — use the big button instead.');
@@ -1017,11 +1035,17 @@ class HushiApp {
     this.byeListener = new WakeWordListener('bye');
     const baseHint = 'talking with ' + this.state.partnerName + ' — say "bye bye" or tap to hang up';
     this.byeListener.on('wake', () => this._toggleCall()); // call is live, so this hangs up
+    this.byeListener.on('mic-live', () => {
+      this.$('conn-state').textContent = '🟢 ' + baseHint;
+    });
+    this.byeListener.on('mic-idle', () => {
+      this.$('conn-state').textContent = '⚪ (restarting mic) ' + baseHint;
+    });
     this.byeListener.on('heard', (transcript) => {
-      if(transcript) this.$('conn-state').textContent = baseHint + ` (heard: "${transcript}")`;
+      if(transcript) this.$('conn-state').textContent = `🟢 heard: "${transcript}" — ` + baseHint;
     });
     this.byeListener.on('error', (reason) => {
-      this.$('conn-state').textContent = baseHint + ` (mic issue: ${reason})`;
+      this.$('conn-state').textContent = `⚪ mic issue: ${reason} — ` + baseHint;
     });
     this.byeListener.on('unsupported', () => {}); // no support — button still works, fail quietly
     this.byeListener.start();
