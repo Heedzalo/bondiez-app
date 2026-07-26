@@ -174,7 +174,7 @@
       <label class="switch"><input type="checkbox" id="cry-toggle"></label>
     </div>
   </div>
-  <p class="disclaimer">Calls are direct device-to-device. Nothing is recorded or stored. Wake phrase and distress detection run only on this device.</p>
+  <p class="disclaimer">The line is always direct, device-to-device. Nothing is recorded or stored. Wake phrase and distress detection run only on this device.</p>
   <button class="footer-link" id="reset-btn">Reset pairing</button>
 </div>
 
@@ -1039,7 +1039,7 @@ class HushiApp {
     });
 
     this.transport.on('silence-timeout', () => {
-      this._showAlert('Call ended — no one was talking for a few minutes.');
+      this._showAlert('Line closed — no one was talking for a few minutes.');
     });
 
     this.transport.on('presence-online', (remoteId) => {
@@ -1082,15 +1082,15 @@ class HushiApp {
     this.callActive = (mode === true);
     if(mode === 'calling'){
       btn.classList.add('calling');
-      btn.textContent = 'Calling…';
-      this.$('conn-state').textContent = 'calling ' + this.state.partnerName + '…';
+      btn.textContent = 'Connecting…';
+      this.$('conn-state').textContent = 'reaching ' + this.state.partnerName + '…';
     } else if(mode === true){
       btn.classList.add('live');
       btn.textContent = 'Live';
-      this.$('conn-state').textContent = 'talking with ' + this.state.partnerName + ' — say "bye bye" or tap to hang up';
+      this.$('conn-state').textContent = 'talking with ' + this.state.partnerName + ' — say "bye bye" or tap to end';
       if(this.$('presence-dot')){
         this.$('presence-dot').className = 'dot ok';
-        this.$('presence-text').textContent = `on the call with ${this.state.partnerName}`;
+        this.$('presence-text').textContent = `live with ${this.state.partnerName}`;
       }
     } else {
       btn.textContent = 'Talk';
@@ -1154,7 +1154,7 @@ class HushiApp {
   _startByeListener(){
     this._pauseWakeForCall(); // idempotent — already paused if a call was starting
     this.byeListener = new WakeWordListener('bye');
-    const baseHint = 'talking with ' + this.state.partnerName + ' — say "bye bye" or tap to hang up';
+    const baseHint = 'talking with ' + this.state.partnerName + ' — say "bye bye" or tap to end';
     this.byeListener.on('wake', () => this._toggleCall()); // call is live, so this hangs up
     this.byeListener.on('mic-live', () => {
       this.$('conn-state').textContent = '🟢 ' + baseHint;
