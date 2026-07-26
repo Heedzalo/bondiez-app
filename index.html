@@ -842,9 +842,12 @@ class HushiApp {
     this.$('partner-name-display').textContent = this.state.partnerName;
     this.$('partner-avatar').textContent = this.state.partnerName.charAt(0).toUpperCase();
     this.$('wake-note').textContent = `Say "${this.state.partnerNick} ${this.state.partnerNick}" or "Alo Alo" to call, hands-free.`;
-    this._startEarbudTrigger();
-    this._setupPushNotifications();
-    this._wireVisibilityRecovery();
+
+    // Each of these is independent — if one throws (e.g. a web API behaving
+    // differently inside the native WebView), it must not block the others.
+    this._setupPushNotifications().catch(e => this._showAlert('Push setup crashed immediately: ' + e.message));
+    try{ this._startEarbudTrigger(); }catch(e){ console.warn('earbud trigger setup failed:', e); }
+    try{ this._wireVisibilityRecovery(); }catch(e){ console.warn('visibility recovery setup failed:', e); }
   }
 
   // ---------- resume cleanly whenever you switch back to this tab ----------
