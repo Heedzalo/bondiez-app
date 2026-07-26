@@ -844,10 +844,84 @@ class HushiApp {
     this.$('wake-note').textContent = `Say "${this.state.partnerNick} ${this.state.partnerNick}" or "Alo Alo" to call, hands-free.`;
     this._startEarbudTrigger();
     this._setupPushNotifications();
+    this._wireVisibilityRecovery();
+  }
+
+  // ---------- resume cleanly whenever you switch back to this tab ----------
+  // A web page can't run a real background service the way the phone's OS
+  // itself can — it can't reach into another app and "wait its turn" for
+  // the mic. This is the honest, best available substitute: the moment you
+  // return to Bondiez (e.g. after a WhatsApp call), it re-checks and
+  // restarts wake listening automatically, instead of staying dead until
+  // you manually flip the toggle off and on again.
+  _wireVisibilityRecovery(){
+    if(this._visibilityWired) return; // only wire this once per app load
+    this._visibilityWired = true;
+    document.addEventListener('visibilitychange', () => {
+      if(document.visibilityState !== 'visible') return;
+      const wantsWake = this.$('wake-toggle').checked;
+      if(wantsWake && (!this.wakeListener || !this.wakeListener.active) && !this.callActive){
+        this._startWake();
+      }
+    });
   }
 
   // ---------- push notifications: reach the other person even if their tab is closed ----------
   async _setupPushNotifications(){
+    const isNativeApp = !!(window.Capacitor && window.Capacitor.isNativePlatform && window.Capacitor.isNativePlatform());
+    this._showAlert(isNativeApp ? 'Push setup: native app detected' : 'Push setup: plain browser detected');
+    if(isNativeApp){
+      await this._setupNativePush();
+    } else {
+      await this._setupWebPush();
+    }
+  }
+
+  // Real app install (via Capacitor) — uses Firebase Cloud Messaging, the
+  // same mechanism WhatsApp/etc use, since browser web-push doesn't work
+  // reliably inside a native WebView.
+  async _setupNativePush(){
+    try{
+      if(!window.Capacitor.Plugins){
+        this._showAlert('Push setup FAILED: Capacitor.Plugins itself missing');
+        return;
+      }
+      const PushNotifications = window.Capacitor.Plugins.PushNotifications;
+      if(!PushNotifications){
+        this._showAlert('Push setup FAILED: PushNotifications plugin not found on this build');
+        return;
+      }
+
+      const permStatus = await PushNotifications.requestPermissions();
+      this._showAlert('Push setup: permission result = ' + permStatus.receive);
+      if(permStatus.receive !== 'granted') return;
+
+      await PushNotifications.addListener('registration', async (tokenResult) => {
+        this._showAlert('Push setup: got FCM token, sending to server…');
+        try{
+          const resp = await fetch(PUSH_SERVER_URL + '/subscribe', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ code: this.state.myCode, type: 'fcm', token: tokenResult.value })
+          });
+          this._showAlert('Push setup: server responded ' + resp.status);
+        }catch(e){
+          this._showAlert('Push setup: failed to reach server — ' + e.message);
+        }
+      });
+
+      await PushNotifications.addListener('registrationError', (err) => {
+        this._showAlert('Push setup FAILED: registration error — ' + JSON.stringify(err));
+      });
+
+      await PushNotifications.register();
+    }catch(e){
+      this._showAlert('Push setup CRASHED: ' + e.message);
+    }
+  }
+
+  // Plain browser (not the installed app) — regular Web Push.
+  async _setupWebPush(){
     if(!('serviceWorker' in navigator) || !('PushManager' in window)) return; // unsupported browser, fail quietly
     try{
       const reg = await navigator.serviceWorker.register('sw.js');
@@ -866,10 +940,10 @@ class HushiApp {
       await fetch(PUSH_SERVER_URL + '/subscribe', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ code: this.state.myCode, subscription: sub })
+        body: JSON.stringify({ code: this.state.myCode, type: 'webpush', subscription: sub })
       });
     }catch(e){
-      console.warn('push setup failed (non-fatal, calling still works normally):', e);
+      console.warn('web push setup failed (non-fatal, calling still works normally):', e);
     }
   }
 
