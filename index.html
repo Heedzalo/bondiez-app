@@ -409,11 +409,18 @@ class PeerJSTransport extends Emitter {
   }
 
   hangUp(){
+    this._cancelCurrentAttempt();
+    this.emit('call-ended');
+  }
+
+  // Same cleanup as hangUp(), but silent — used right before an automatic
+  // retry, where re-emitting 'call-ended' would recursively re-trigger the
+  // retry handler itself instead of just clearing the way for a fresh attempt.
+  _cancelCurrentAttempt(){
     this._stopSilenceWatcher();
-    if(this.currentCall) this.currentCall.close();
+    if(this.currentCall){ this.currentCall.close(); this.currentCall = null; }
     if(this._micStream){ this._micStream.getTracks().forEach(t => t.stop()); this._micStream = null; }
     this._remoteStream = null;
-    this.emit('call-ended');
   }
 
   sendData(payload){
@@ -974,7 +981,13 @@ class HushiApp {
       if(this._callRetryTimer){ clearTimeout(this._callRetryTimer); this._callRetryTimer = null; }
       if(!this._callConnectedThisAttempt && this._callRetryDeadline && Date.now() < this._callRetryDeadline){
         this._setLiveUI('calling');
-        this._callRetryTimer = setTimeout(() => this.transport.callPeer(this.state.partnerCode), 2500);
+        this._callRetryTimer = setTimeout(() => {
+          // Fully tear down whatever's left of the previous attempt before
+          // starting a new one — retrying on top of a still-live attempt is
+          // what caused overlapping connections and the repeating sound.
+          this.transport._cancelCurrentAttempt();
+          this.transport.callPeer(this.state.partnerCode);
+        }, 2500);
       } else {
         this._callRetryDeadline = null;
       }
@@ -1157,7 +1170,7 @@ class HushiApp {
       this._pauseWakeForCall();
       this._setLiveUI('calling');
       this._callConnectedThisAttempt = false;
-      this._callRetryDeadline = Date.now() + 25000; // keep trying for 25s — enough time for a closed app to wake, launch, and reconnect
+      this._callRetryDeadline = Date.now() + 60000; // 60s — realistically covers push delivery, noticing + tapping the notification, and a full cold app launch
       this.transport.callPeer(this.state.partnerCode);
       fetch(PUSH_SERVER_URL + '/notify', {
         method: 'POST',
