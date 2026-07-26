@@ -389,6 +389,7 @@ class PeerJSTransport extends Emitter {
   }
 
   callPeer(peerId){
+    if(this._micStream){ this._micStream.getTracks().forEach(t => t.stop()); this._micStream = null; }
     this.partnerId = peerId;
     navigator.mediaDevices.getUserMedia({ audio: true }).then(stream => {
       this._micStream = stream;
@@ -963,10 +964,21 @@ class HushiApp {
     });
     this.transport.on('incoming-call', () => { this._pauseWakeForCall(); this._setLiveUI(true); });
     this.transport.on('call-connected', () => {
+      this._callConnectedThisAttempt = true;
       this._setLiveUI(true);
       setTimeout(() => { if(this.callActive) this._startByeListener(); }, 600);
     });
-    this.transport.on('call-ended', () => { this._setLiveUI(false); this._stopByeListener(); });
+    this.transport.on('call-ended', () => {
+      this._setLiveUI(false);
+      this._stopByeListener();
+      if(this._callRetryTimer){ clearTimeout(this._callRetryTimer); this._callRetryTimer = null; }
+      if(!this._callConnectedThisAttempt && this._callRetryDeadline && Date.now() < this._callRetryDeadline){
+        this._setLiveUI('calling');
+        this._callRetryTimer = setTimeout(() => this.transport.callPeer(this.state.partnerCode), 2500);
+      } else {
+        this._callRetryDeadline = null;
+      }
+    });
     this.transport.on('error', msg => {
       if(this.callActive) return; // a live call already proves the link is fine
       const waitingVisible = this.$('waiting-screen').style.display !== 'none';
@@ -1138,10 +1150,14 @@ class HushiApp {
   _toggleCall(){
     const btn = this.$('big-btn');
     if(btn.classList.contains('live') || btn.classList.contains('calling')){
+      if(this._callRetryTimer){ clearTimeout(this._callRetryTimer); this._callRetryTimer = null; }
+      this._callRetryDeadline = null;
       this.transport.hangUp();
     } else {
       this._pauseWakeForCall();
       this._setLiveUI('calling');
+      this._callConnectedThisAttempt = false;
+      this._callRetryDeadline = Date.now() + 25000; // keep trying for 25s — enough time for a closed app to wake, launch, and reconnect
       this.transport.callPeer(this.state.partnerCode);
       fetch(PUSH_SERVER_URL + '/notify', {
         method: 'POST',
