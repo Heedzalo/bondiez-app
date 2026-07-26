@@ -891,6 +891,23 @@ class HushiApp {
   // Real app install (via Capacitor) — uses Firebase Cloud Messaging, the
   // same mechanism WhatsApp/etc use, since browser web-push doesn't work
   // reliably inside a native WebView.
+  // ---------- foreground service: keeps audio alive if the app is backgrounded mid-call ----------
+  _startCallProtection(){
+    try{
+      const isNativeApp = !!(window.Capacitor && window.Capacitor.isNativePlatform && window.Capacitor.isNativePlatform());
+      if(!isNativeApp || !window.Capacitor.Plugins.CallForeground) return;
+      window.Capacitor.Plugins.CallForeground.start({ partnerName: this.state.partnerName || 'your person' });
+    }catch(e){ console.warn('call protection start failed (non-fatal):', e); }
+  }
+
+  _stopCallProtection(){
+    try{
+      const isNativeApp = !!(window.Capacitor && window.Capacitor.isNativePlatform && window.Capacitor.isNativePlatform());
+      if(!isNativeApp || !window.Capacitor.Plugins.CallForeground) return;
+      window.Capacitor.Plugins.CallForeground.stop();
+    }catch(e){ console.warn('call protection stop failed (non-fatal):', e); }
+  }
+
   async _setupNativePush(){
     try{
       if(!window.Capacitor.Plugins){
@@ -974,10 +991,12 @@ class HushiApp {
       this._callConnectedThisAttempt = true;
       this._setLiveUI(true);
       setTimeout(() => { if(this.callActive) this._startByeListener(); }, 600);
+      this._startCallProtection();
     });
     this.transport.on('call-ended', () => {
       this._setLiveUI(false);
       this._stopByeListener();
+      this._stopCallProtection();
       if(this._callRetryTimer){ clearTimeout(this._callRetryTimer); this._callRetryTimer = null; }
       if(!this._callConnectedThisAttempt && this._callRetryDeadline && Date.now() < this._callRetryDeadline){
         this._setLiveUI('calling');
