@@ -1151,11 +1151,10 @@ class HushiApp {
         this.$('presence-dot').className = 'dot ok';
         this.$('presence-text').textContent = `${this.state.partnerName} has the app open`;
       }
-      // Only one side should build the warm connection, or both would race
-      // and create duplicates — simple deterministic rule so exactly one wins.
-      if(this.state.myCode < this.state.partnerCode){
-        this.transport.ensureWarmConnection(this.state.partnerCode);
-      }
+      // Warm-connection instant-connect feature disabled for now — it caused
+      // a real regression on first test. Reverted to the simpler, previously
+      // working negotiate-fresh-every-time behavior. Worth rebuilding this
+      // more carefully later, with better testing, not live on a working app.
     });
 
     this.transport.on('presence-offline', () => {
@@ -1275,26 +1274,8 @@ class HushiApp {
     if(btn.classList.contains('live') || btn.classList.contains('calling')){
       if(this._callRetryTimer){ clearTimeout(this._callRetryTimer); this._callRetryTimer = null; }
       this._callRetryDeadline = null;
-      if(this.transport._warm){
-        // Soft-close — keeps the connection alive muted, so next time is instant too.
-        this.transport.closeWarmChannel();
-        this._setLiveUI(false);
-        this._stopByeListener();
-        this._stopCallProtection();
-      } else {
-        this.transport.hangUp();
-      }
-    } else if(this.transport._warm && this.transport.currentCall){
-      // Already warm and connected — this is the fast path, no negotiation needed.
-      this._pauseWakeForCall();
-      this.transport.openWarmChannel();
-      this._callConnectedThisAttempt = true;
-      this._setLiveUI(true);
-      setTimeout(() => { if(this.callActive) this._startByeListener(); }, 600);
-      this._startCallProtection();
+      this.transport.hangUp();
     } else {
-      // Not warm yet (e.g. they were fully closed and just auto-launched) —
-      // fall back to the full negotiation path, same as always.
       this._pauseWakeForCall();
       this._setLiveUI('calling');
       this._callConnectedThisAttempt = false;
