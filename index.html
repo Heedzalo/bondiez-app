@@ -915,6 +915,8 @@ class HushiApp {
     try{ this._startEarbudTrigger(); }catch(e){ console.warn('earbud trigger setup failed:', e); }
     try{ this._wireVisibilityRecovery(); }catch(e){ console.warn('visibility recovery setup failed:', e); }
     this._checkEarbudLaunchTrigger();
+    this._checkNativeAnswerTrigger();
+    this._registerCallingAccountOnce();
   }
 
   // ---------- was this app-open caused by an earbud double-tap while fully closed? ----------
@@ -925,6 +927,31 @@ class HushiApp {
       const result = await window.Capacitor.Plugins.CallForeground.checkEarbudTrigger();
       if(result && result.triggered) this._toggleCall();
     }catch(e){ /* best-effort — a plain button tap always still works regardless */ }
+  }
+
+  // ---------- was this app-open caused by answering a real native incoming call? ----------
+  async _checkNativeAnswerTrigger(){
+    try{
+      const isNativeApp = !!(window.Capacitor && window.Capacitor.isNativePlatform && window.Capacitor.isNativePlatform());
+      if(!isNativeApp || !window.Capacitor.Plugins.CallForeground) return;
+      const result = await window.Capacitor.Plugins.CallForeground.checkNativeAnswer();
+      if(result && result.answered) this._toggleCall();
+    }catch(e){ /* best-effort — the existing notification-based path still works regardless */ }
+  }
+
+  // ---------- one-time setup: register Bondiez as a real Android calling account ----------
+  // Experimental — this is the newest, least-tested piece. If anything about it
+  // fails on a given phone, it fails quietly here and everything else (mic,
+  // notifications, auto-launch) keeps working exactly as before, unaffected.
+  async _registerCallingAccountOnce(){
+    try{
+      const isNativeApp = !!(window.Capacitor && window.Capacitor.isNativePlatform && window.Capacitor.isNativePlatform());
+      if(!isNativeApp || !window.Capacitor.Plugins.CallForeground) return;
+      if(localStorage.getItem('bondiez_calling_account_registered')) return;
+      await window.Capacitor.Plugins.CallForeground.registerCallingAccount();
+      localStorage.setItem('bondiez_calling_account_registered', '1');
+      this._showAlert('One more setup step: find "Bondiez" in the calling accounts screen that just opened, and turn it on.');
+    }catch(e){ console.warn('calling account registration failed (non-fatal):', e); }
   }
 
   // ---------- resume cleanly whenever you switch back to this tab ----------
@@ -966,6 +993,7 @@ class HushiApp {
       const isNativeApp = !!(window.Capacitor && window.Capacitor.isNativePlatform && window.Capacitor.isNativePlatform());
       if(!isNativeApp || !window.Capacitor.Plugins.CallForeground) return;
       window.Capacitor.Plugins.CallForeground.start({ partnerName: this.state.partnerName || 'your person' });
+      window.Capacitor.Plugins.CallForeground.markConnectionActive().catch(() => {});
     }catch(e){ console.warn('call protection start failed (non-fatal):', e); }
   }
 
@@ -974,6 +1002,7 @@ class HushiApp {
       const isNativeApp = !!(window.Capacitor && window.Capacitor.isNativePlatform && window.Capacitor.isNativePlatform());
       if(!isNativeApp || !window.Capacitor.Plugins.CallForeground) return;
       window.Capacitor.Plugins.CallForeground.stop();
+      window.Capacitor.Plugins.CallForeground.markConnectionEnded().catch(() => {});
     }catch(e){ console.warn('call protection stop failed (non-fatal):', e); }
   }
 
@@ -1280,43 +1309,4 @@ class HushiApp {
       if(this._callRetryTimer){ clearTimeout(this._callRetryTimer); this._callRetryTimer = null; }
       this._callRetryDeadline = null;
       if(this.transport._warm){
-        // Soft-close — keeps the connection alive muted, so next time is instant too.
-        this.transport.closeWarmChannel();
-        this._setLiveUI(false);
-        this._stopByeListener();
-        this._stopCallProtection();
-      } else {
-        this.transport.hangUp();
-      }
-    } else if(this.transport._warm && this.transport.currentCall){
-      // Already warm and connected — this is the fast path, no negotiation needed.
-      this._pauseWakeForCall();
-      this.transport.openWarmChannel();
-      this._callConnectedThisAttempt = true;
-      this._setLiveUI(true);
-      setTimeout(() => { if(this.callActive) this._startByeListener(); }, 600);
-      this._startCallProtection();
-    } else {
-      // Not warm yet (e.g. they were fully closed and just auto-launched) —
-      // fall back to the full negotiation path, same as always.
-      this._pauseWakeForCall();
-      this._setLiveUI('calling');
-      this._callConnectedThisAttempt = false;
-      this._callRetryDeadline = Date.now() + 60000; // 60s — realistically covers push delivery, noticing + tapping the notification, and a full cold app launch
-      this.transport.callPeer(this.state.partnerCode);
-      fetch(PUSH_SERVER_URL + '/notify', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ code: this.state.partnerCode, callerName: this.state.myName })
-      }).catch(() => {}); // best-effort — never let a push failure block the actual call
-    }
-  }
-
-  // ---------- earbud button presses (e.g. double-tap) as a main calling trigger ----------
-  // This needs a "live" (even if silent) audio element for the OS to route
-  // hardware media-button presses to this page at all. Different earbuds map
-  // their gesture to different signals, so we treat several as equivalent.
-  _startEarbudTrigger(){
-    if(!('mediaSession' in navigator)) return;
-
-    navigator.mediaSessio
+        // Soft-close — keeps the connection alive muted, so next t
