@@ -333,13 +333,25 @@ class PeerJSTransport extends Emitter {
         incomingCall.close();
         return;
       }
+      const isWarm = !!(incomingCall.metadata && incomingCall.metadata.warm);
       navigator.mediaDevices.getUserMedia({ audio: true }).then(stream => {
+        if(isWarm) stream.getAudioTracks().forEach(t => t.enabled = false); // stays quiet until actually opened
         incomingCall.answer(stream);
         this.currentCall = incomingCall;
         this._micStream = stream; // so hangUp() can stop it, same as the calling side
-        this.emit('incoming-call');
-        incomingCall.on('stream', rs => { this._attachRemote(rs); this.emit('call-connected'); this._startSilenceWatcher(); });
-        incomingCall.on('close', () => this.emit('call-ended'));
+
+        if(isWarm){
+          incomingCall.on('stream', rs => {
+            this._remoteStream = rs;
+            this._attachRemote(rs);
+            this._warm = true;
+            this.emit('warm-ready');
+          });
+        } else {
+          this.emit('incoming-call');
+          incomingCall.on('stream', rs => { this._attachRemote(rs); this.emit('call-connected'); this._startSilenceWatcher(); });
+        }
+        incomingCall.on('close', () => { this._warm = false; this.emit('call-ended'); });
       }).catch(() => this.emit('error', 'mic permission needed'));
     });
 
@@ -408,6 +420,50 @@ class PeerJSTransport extends Emitter {
     });
   }
 
+  // ---------- warm connection: pre-established and muted, so "Talk" can be
+  // an instant unmute instead of negotiating a fresh connection every time ----------
+  ensureWarmConnection(peerId){
+    if(this.currentCall || this._warmingUp) return; // already have one, or already building one
+    this._warmingUp = true;
+    this.partnerId = peerId;
+    navigator.mediaDevices.getUserMedia({ audio: true }).then(stream => {
+      stream.getAudioTracks().forEach(t => t.enabled = false); // muted from the start — background link, not a live line
+      this._micStream = stream;
+      this.currentCall = this.peer.call(peerId, stream, { metadata: { warm: true } });
+      this._warmingUp = false;
+
+      this.currentCall.on('stream', rs => {
+        this._remoteStream = rs;
+        this._attachRemote(rs);
+        this._warm = true;
+        this.emit('warm-ready');
+      });
+      this.currentCall.on('close', () => { this._warm = false; this.currentCall = null; this.emit('call-ended'); });
+      this.currentCall.on('error', () => { this._warm = false; this.currentCall = null; });
+
+      if(!this.dataConn){
+        this.dataConn = this.peer.connect(peerId);
+        this.dataConn.on('data', payload => this.emit('data', payload));
+      }
+    }).catch(() => { this._warmingUp = false; });
+  }
+
+  // Opens the already-warm line instantly — no negotiation, just flip the mic on
+  // and tell the other side to do the same, so it's genuinely two-way immediately.
+  openWarmChannel(){
+    if(this._micStream) this._micStream.getAudioTracks().forEach(t => t.enabled = true);
+    this.sendData({ type: 'open-channel' });
+    this._startSilenceWatcher();
+  }
+
+  // Goes quiet again but keeps the underlying connection alive, so next time
+  // is instant too — this is deliberately not a full hangUp().
+  closeWarmChannel(){
+    this._stopSilenceWatcher();
+    if(this._micStream) this._micStream.getAudioTracks().forEach(t => t.enabled = false);
+    this.sendData({ type: 'close-channel' });
+  }
+
   hangUp(){
     this._cancelCurrentAttempt();
     this.emit('call-ended');
@@ -418,6 +474,7 @@ class PeerJSTransport extends Emitter {
   // retry handler itself instead of just clearing the way for a fresh attempt.
   _cancelCurrentAttempt(){
     this._stopSilenceWatcher();
+    this._warm = false;
     if(this.currentCall){ this.currentCall.close(); this.currentCall = null; }
     if(this._micStream){ this._micStream.getTracks().forEach(t => t.stop()); this._micStream = null; }
     this._remoteStream = null;
@@ -487,7 +544,8 @@ class PeerJSTransport extends Emitter {
             side.lastSoundAt = now;
           } else if(now - side.lastSoundAt > SILENCE_LIMIT_MS){
             this.emit('silence-timeout');
-            this.hangUp();
+            if(this._warm){ this.closeWarmChannel(); this.emit('call-ended'); }
+            else { this.hangUp(); }
             return;
           }
         }
@@ -1036,6 +1094,27 @@ class HushiApp {
       if(payload.type === 'distress-alert'){
         this._showAlert(`${this.state.partnerName} may need attention.`);
       }
+      if(payload.type === 'open-channel'){
+        // They just opened their side — open ours too, so it's genuinely
+        // two-way the instant either person triggers it, not one-way.
+        if(this.transport._micStream) this.transport._micStream.getAudioTracks().forEach(t => t.enabled = true);
+        this.transport._startSilenceWatcher();
+        this._callConnectedThisAttempt = true;
+        this._setLiveUI(true);
+        setTimeout(() => { if(this.callActive) this._startByeListener(); }, 600);
+        this._startCallProtection();
+      }
+      if(payload.type === 'close-channel'){
+        if(this.transport._micStream) this.transport._micStream.getAudioTracks().forEach(t => t.enabled = false);
+        this.transport._stopSilenceWatcher();
+        this._setLiveUI(false);
+        this._stopByeListener();
+        this._stopCallProtection();
+      }
+    });
+
+    this.transport.on('warm-ready', () => {
+      console.log('warm connection ready — Talk will be instant from here');
     });
 
     this.transport.on('silence-timeout', () => {
@@ -1060,6 +1139,11 @@ class HushiApp {
       if(this.$('presence-dot')){
         this.$('presence-dot').className = 'dot ok';
         this.$('presence-text').textContent = `${this.state.partnerName} has the app open`;
+      }
+      // Only one side should build the warm connection, or both would race
+      // and create duplicates — simple deterministic rule so exactly one wins.
+      if(this.state.myCode < this.state.partnerCode){
+        this.transport.ensureWarmConnection(this.state.partnerCode);
       }
     });
 
@@ -1102,11 +1186,7 @@ class HushiApp {
   _startWake(){
     this.wakeListener = new WakeWordListener([this.state.partnerNick, 'alo', 'allo']);
     const baseHint = `Say "${this.state.partnerNick} ${this.state.partnerNick}" or "Alo Alo" to call, hands-free.`;
-    this.wakeListener.on('wake', () => {
-      this._pauseWakeForCall();
-      this._setLiveUI('calling');
-      this.transport.callPeer(this.state.partnerCode);
-    });
+    this.wakeListener.on('wake', () => this._toggleCall());
     this.wakeListener.on('listening', () => {
       this.$('wake-note').textContent = baseHint + ' (listening…)';
     });
@@ -1184,8 +1264,26 @@ class HushiApp {
     if(btn.classList.contains('live') || btn.classList.contains('calling')){
       if(this._callRetryTimer){ clearTimeout(this._callRetryTimer); this._callRetryTimer = null; }
       this._callRetryDeadline = null;
-      this.transport.hangUp();
+      if(this.transport._warm){
+        // Soft-close — keeps the connection alive muted, so next time is instant too.
+        this.transport.closeWarmChannel();
+        this._setLiveUI(false);
+        this._stopByeListener();
+        this._stopCallProtection();
+      } else {
+        this.transport.hangUp();
+      }
+    } else if(this.transport._warm && this.transport.currentCall){
+      // Already warm and connected — this is the fast path, no negotiation needed.
+      this._pauseWakeForCall();
+      this.transport.openWarmChannel();
+      this._callConnectedThisAttempt = true;
+      this._setLiveUI(true);
+      setTimeout(() => { if(this.callActive) this._startByeListener(); }, 600);
+      this._startCallProtection();
     } else {
+      // Not warm yet (e.g. they were fully closed and just auto-launched) —
+      // fall back to the full negotiation path, same as always.
       this._pauseWakeForCall();
       this._setLiveUI('calling');
       this._callConnectedThisAttempt = false;
