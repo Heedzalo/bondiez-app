@@ -914,6 +914,17 @@ class HushiApp {
     this._setupPushNotifications().catch(e => this._showAlert('Push setup crashed immediately: ' + e.message));
     try{ this._startEarbudTrigger(); }catch(e){ console.warn('earbud trigger setup failed:', e); }
     try{ this._wireVisibilityRecovery(); }catch(e){ console.warn('visibility recovery setup failed:', e); }
+    this._checkEarbudLaunchTrigger();
+  }
+
+  // ---------- was this app-open caused by an earbud double-tap while fully closed? ----------
+  async _checkEarbudLaunchTrigger(){
+    try{
+      const isNativeApp = !!(window.Capacitor && window.Capacitor.isNativePlatform && window.Capacitor.isNativePlatform());
+      if(!isNativeApp || !window.Capacitor.Plugins.CallForeground) return;
+      const result = await window.Capacitor.Plugins.CallForeground.checkEarbudTrigger();
+      if(result && result.triggered) this._toggleCall();
+    }catch(e){ /* best-effort — a plain button tap always still works regardless */ }
   }
 
   // ---------- resume cleanly whenever you switch back to this tab ----------
