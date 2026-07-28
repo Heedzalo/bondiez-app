@@ -175,7 +175,6 @@
     </div>
   </div>
   <p class="disclaimer">The line is always direct, device-to-device. Nothing is recorded or stored. Wake phrase and distress detection run only on this device.</p>
-  <button class="footer-link" id="enable-native-calling-btn" style="display:none;">Enable native calling (better reliability)</button>
   <button class="footer-link" id="reset-btn">Reset pairing</button>
 </div>
 
@@ -916,8 +915,6 @@ class HushiApp {
     try{ this._startEarbudTrigger(); }catch(e){ console.warn('earbud trigger setup failed:', e); }
     try{ this._wireVisibilityRecovery(); }catch(e){ console.warn('visibility recovery setup failed:', e); }
     this._checkEarbudLaunchTrigger();
-    this._checkNativeAnswerTrigger();
-    this._maybeShowEnableCallingAccountButton();
   }
 
   // ---------- was this app-open caused by an earbud double-tap while fully closed? ----------
@@ -928,44 +925,6 @@ class HushiApp {
       const result = await window.Capacitor.Plugins.CallForeground.checkEarbudTrigger();
       if(result && result.triggered) this._toggleCall();
     }catch(e){ /* best-effort — a plain button tap always still works regardless */ }
-  }
-
-  // ---------- was this app-open caused by answering a real native incoming call? ----------
-  // Just checking a stored flag — doesn't open any settings screen, so this is
-  // safe to run automatically on every launch, unlike registering the account.
-  async _checkNativeAnswerTrigger(){
-    try{
-      const isNativeApp = !!(window.Capacitor && window.Capacitor.isNativePlatform && window.Capacitor.isNativePlatform());
-      if(!isNativeApp || !window.Capacitor.Plugins.CallForeground) return;
-      const result = await window.Capacitor.Plugins.CallForeground.checkNativeAnswer();
-      if(result && result.answered) this._toggleCall();
-    }catch(e){ /* best-effort — the existing notification-based path still works regardless */ }
-  }
-
-  // ---------- shows a manual, explicit button for the (experimental) native calling account ----------
-  // Deliberately NEVER automatic — firing this settings redirect on launch,
-  // stacked with the others, is exactly what caused a blank screen once
-  // already. Only ever happens from a real tap, whenever the person chooses.
-  async _maybeShowEnableCallingAccountButton(){
-    try{
-      const isNativeApp = !!(window.Capacitor && window.Capacitor.isNativePlatform && window.Capacitor.isNativePlatform());
-      const btn = this.$('enable-native-calling-btn');
-      if(!isNativeApp || !window.Capacitor.Plugins.CallForeground || !btn) return;
-      const result = await window.Capacitor.Plugins.CallForeground.isCallingAccountRegistered();
-      if(result && result.registered) return; // already done, stay hidden
-      btn.style.display = 'block';
-      btn.onclick = async () => {
-        btn.disabled = true;
-        btn.textContent = 'Opening settings…';
-        try{
-          await window.Capacitor.Plugins.CallForeground.registerCallingAccount();
-          btn.style.display = 'none';
-        }catch(e){
-          btn.disabled = false;
-          btn.textContent = 'Enable native calling (better reliability)';
-        }
-      };
-    }catch(e){ /* fine — everything else works regardless of this */ }
   }
 
   // ---------- resume cleanly whenever you switch back to this tab ----------
@@ -1007,7 +966,6 @@ class HushiApp {
       const isNativeApp = !!(window.Capacitor && window.Capacitor.isNativePlatform && window.Capacitor.isNativePlatform());
       if(!isNativeApp || !window.Capacitor.Plugins.CallForeground) return;
       window.Capacitor.Plugins.CallForeground.start({ partnerName: this.state.partnerName || 'your person' });
-      window.Capacitor.Plugins.CallForeground.markConnectionActive().catch(() => {});
     }catch(e){ console.warn('call protection start failed (non-fatal):', e); }
   }
 
@@ -1016,7 +974,6 @@ class HushiApp {
       const isNativeApp = !!(window.Capacitor && window.Capacitor.isNativePlatform && window.Capacitor.isNativePlatform());
       if(!isNativeApp || !window.Capacitor.Plugins.CallForeground) return;
       window.Capacitor.Plugins.CallForeground.stop();
-      window.Capacitor.Plugins.CallForeground.markConnectionEnded().catch(() => {});
     }catch(e){ console.warn('call protection stop failed (non-fatal):', e); }
   }
 
@@ -1307,4 +1264,59 @@ class HushiApp {
       this.$('conn-state').textContent = `⚪ mic issue: ${reason} — ` + baseHint;
     });
     this.byeListener.on('unsupported', () => {}); // no support — button still works, fail quietly
-    this.byeListener.sta
+    this.byeListener.start();
+  }
+
+  _stopByeListener(){
+    if(this.byeListener) this.byeListener.stop();
+    this.byeListener = null;
+    this._resumeWakeIfNeeded();
+  }
+
+  // ---------- shared call toggle: button, wake word, and earbuds all use this ----------
+  _toggleCall(){
+    const btn = this.$('big-btn');
+    if(btn.classList.contains('live') || btn.classList.contains('calling')){
+      if(this._callRetryTimer){ clearTimeout(this._callRetryTimer); this._callRetryTimer = null; }
+      this._callRetryDeadline = null;
+      if(this.transport._warm){
+        // Soft-close — keeps the connection alive muted, so next time is instant too.
+        this.transport.closeWarmChannel();
+        this._setLiveUI(false);
+        this._stopByeListener();
+        this._stopCallProtection();
+      } else {
+        this.transport.hangUp();
+      }
+    } else if(this.transport._warm && this.transport.currentCall){
+      // Already warm and connected — this is the fast path, no negotiation needed.
+      this._pauseWakeForCall();
+      this.transport.openWarmChannel();
+      this._callConnectedThisAttempt = true;
+      this._setLiveUI(true);
+      setTimeout(() => { if(this.callActive) this._startByeListener(); }, 600);
+      this._startCallProtection();
+    } else {
+      // Not warm yet (e.g. they were fully closed and just auto-launched) —
+      // fall back to the full negotiation path, same as always.
+      this._pauseWakeForCall();
+      this._setLiveUI('calling');
+      this._callConnectedThisAttempt = false;
+      this._callRetryDeadline = Date.now() + 60000; // 60s — realistically covers push delivery, noticing + tapping the notification, and a full cold app launch
+      this.transport.callPeer(this.state.partnerCode);
+      fetch(PUSH_SERVER_URL + '/notify', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ code: this.state.partnerCode, callerName: this.state.myName })
+      }).catch(() => {}); // best-effort — never let a push failure block the actual call
+    }
+  }
+
+  // ---------- earbud button presses (e.g. double-tap) as a main calling trigger ----------
+  // This needs a "live" (even if silent) audio element for the OS to route
+  // hardware media-button presses to this page at all. Different earbuds map
+  // their gesture to different signals, so we treat several as equivalent.
+  _startEarbudTrigger(){
+    if(!('mediaSession' in navigator)) return;
+
+    navigator.mediaSessio
