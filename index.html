@@ -1319,4 +1319,54 @@ class HushiApp {
   _startEarbudTrigger(){
     if(!('mediaSession' in navigator)) return;
 
-    navigator.mediaSessio
+    navigator.mediaSession.metadata = new MediaMetadata({
+      title: this.state.partnerName || 'Bondiez',
+      artist: 'Bondiez'
+    });
+
+    const trigger = () => this._toggleCall();
+    ['play', 'pause', 'nexttrack', 'previoustrack'].forEach(action => {
+      try { navigator.mediaSession.setActionHandler(action, trigger); }
+      catch(e) { /* some browsers don't support every action type — skip it */ }
+    });
+
+    const audio = this.$('keepalive-audio');
+    audio.volume = 0.01;
+    const tryPlay = () => audio.play().catch(() => {});
+    tryPlay();
+    // Autoplay is often blocked until a real user gesture happens —
+    // this catches the first tap anywhere and retries once.
+    document.addEventListener('click', tryPlay, { once: true });
+  }
+
+  // ---------- status helpers ----------
+  _showAlert(text){
+    const b = this.$('alert-banner');
+    b.textContent = text;
+    b.style.display = 'block';
+    setTimeout(() => { b.style.display = 'none'; }, 12000);
+  }
+
+  _updateNetworkStatus(){
+    const online = navigator.onLine;
+    this.$('net-dot').className = 'dot ' + (online ? 'ok' : 'warn');
+    this.$('net-text').textContent = online ? 'online' : 'offline';
+  }
+
+  async _updateBattery(){
+    try{
+      if(navigator.getBattery){
+        const b = await navigator.getBattery();
+        const render = () => this.$('battery-text').textContent = Math.round(b.level * 100) + '%' + (b.charging ? ' ⚡' : '');
+        render();
+        b.addEventListener('levelchange', render);
+        b.addEventListener('chargingchange', render);
+      }
+    }catch(e){ /* battery api unavailable, skip silently */ }
+  }
+}
+
+new HushiApp();
+</script>
+</body>
+</html>
