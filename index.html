@@ -171,7 +171,7 @@
         <div class="label">Distress sound detection</div>
         <div class="note">Experimental. Listens locally for sustained loud/crying-like sound and alerts your person. Expect false alarms — this is a prototype, not a medical or safety guarantee.</div>
       </div>
-      <label class="switch"><input type="checkbox" id="cry-toggle"></label>
+      <label class="switch"><input type="checkbox" id="cry-toggle"><span class="slider"></span></label>
     </div>
   </div>
   <p class="disclaimer">The line is always direct, device-to-device. Nothing is recorded or stored. Wake phrase and distress detection run only on this device.</p>
@@ -915,6 +915,7 @@ class HushiApp {
     try{ this._startEarbudTrigger(); }catch(e){ console.warn('earbud trigger setup failed:', e); }
     try{ this._wireVisibilityRecovery(); }catch(e){ console.warn('visibility recovery setup failed:', e); }
     this._checkEarbudLaunchTrigger();
+    this._checkNativeAnswerTrigger();
   }
 
   // ---------- was this app-open caused by an earbud double-tap while fully closed? ----------
@@ -925,6 +926,16 @@ class HushiApp {
       const result = await window.Capacitor.Plugins.CallForeground.checkEarbudTrigger();
       if(result && result.triggered) this._toggleCall();
     }catch(e){ /* best-effort — a plain button tap always still works regardless */ }
+  }
+
+  // ---------- was this app-open caused by answering a real native incoming call? ----------
+  async _checkNativeAnswerTrigger(){
+    try{
+      const isNativeApp = !!(window.Capacitor && window.Capacitor.isNativePlatform && window.Capacitor.isNativePlatform());
+      if(!isNativeApp || !window.Capacitor.Plugins.CallForeground) return;
+      const result = await window.Capacitor.Plugins.CallForeground.checkNativeAnswer();
+      if(result && result.answered) this._toggleCall();
+    }catch(e){ /* best-effort — the existing notification-based path still works regardless */ }
   }
 
   // ---------- resume cleanly whenever you switch back to this tab ----------
@@ -966,6 +977,7 @@ class HushiApp {
       const isNativeApp = !!(window.Capacitor && window.Capacitor.isNativePlatform && window.Capacitor.isNativePlatform());
       if(!isNativeApp || !window.Capacitor.Plugins.CallForeground) return;
       window.Capacitor.Plugins.CallForeground.start({ partnerName: this.state.partnerName || 'your person' });
+      window.Capacitor.Plugins.CallForeground.markConnectionActive().catch(() => {});
     }catch(e){ console.warn('call protection start failed (non-fatal):', e); }
   }
 
@@ -974,6 +986,7 @@ class HushiApp {
       const isNativeApp = !!(window.Capacitor && window.Capacitor.isNativePlatform && window.Capacitor.isNativePlatform());
       if(!isNativeApp || !window.Capacitor.Plugins.CallForeground) return;
       window.Capacitor.Plugins.CallForeground.stop();
+      window.Capacitor.Plugins.CallForeground.markConnectionEnded().catch(() => {});
     }catch(e){ console.warn('call protection stop failed (non-fatal):', e); }
   }
 
@@ -1199,6 +1212,7 @@ class HushiApp {
 
   // ---------- wake word wiring ----------
   _startWake(){
+    if(this.wakeListener) this.wakeListener.stop(); // cheap safety net against any leftover mic instance
     this.wakeListener = new WakeWordListener([this.state.partnerNick, 'alo', 'allo']);
     const baseHint = `Say "${this.state.partnerNick} ${this.state.partnerNick}" or "Alo Alo" to call, hands-free.`;
     this.wakeListener.on('wake', () => this._toggleCall());
@@ -1296,6 +1310,7 @@ class HushiApp {
       this._setLiveUI(true);
       setTimeout(() => { if(this.callActive) this._startByeListener(); }, 600);
       this._startCallProtection();
+      this._placeNativeCallIfAvailable();
     } else {
       // Not warm yet (e.g. they were fully closed and just auto-launched) —
       // fall back to the full negotiation path, same as always.
@@ -1304,12 +1319,24 @@ class HushiApp {
       this._callConnectedThisAttempt = false;
       this._callRetryDeadline = Date.now() + 60000; // 60s — realistically covers push delivery, noticing + tapping the notification, and a full cold app launch
       this.transport.callPeer(this.state.partnerCode);
+      this._placeNativeCallIfAvailable();
       fetch(PUSH_SERVER_URL + '/notify', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ code: this.state.partnerCode, callerName: this.state.myName })
       }).catch(() => {}); // best-effort — never let a push failure block the actual call
     }
+  }
+
+  // Best-effort — places a real native "call" so our own outgoing line gets
+  // proper system integration too. Silently does nothing if the calling
+  // account isn't registered/enabled yet, or on plain web.
+  _placeNativeCallIfAvailable(){
+    try{
+      const isNativeApp = !!(window.Capacitor && window.Capacitor.isNativePlatform && window.Capacitor.isNativePlatform());
+      if(!isNativeApp || !window.Capacitor.Plugins.CallForeground) return;
+      window.Capacitor.Plugins.CallForeground.placeNativeCall().catch(() => {});
+    }catch(e){ /* fine — the call itself still works without this */ }
   }
 
   // ---------- earbud button presses (e.g. double-tap) as a main calling trigger ----------
@@ -1366,7 +1393,22 @@ class HushiApp {
   }
 }
 
-new HushiApp();
+// Turns any uncaught crash into a visible message instead of a silent
+// blank/black screen — genuinely useful safety net, cheap to have.
+window.onerror = function(message, source, line, col, error){
+  document.body.innerHTML = `<div style="color:#f3ece7;background:#0d0b10;padding:20px;font-family:sans-serif;line-height:1.6;">
+    <b>Bondiez hit an error:</b><br>${message}<br>Line: ${line}
+  </div>`;
+};
+
+try {
+  new HushiApp();
+} catch(e) {
+  document.body.innerHTML = `<div style="color:#f3ece7;background:#0d0b10;padding:20px;font-family:sans-serif;line-height:1.6;">
+    <b>Bondiez crashed on startup:</b><br>${e.message}
+  </div>`;
+  console.error(e);
+}
 </script>
 </body>
 </html>
