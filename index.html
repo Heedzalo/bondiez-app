@@ -605,12 +605,25 @@ class WakeWordListener extends Emitter {
 
     // Matches the phrase as a whole — handles multi-word nicknames like "my
     // man" correctly (the old version only ever checked single words, so a
-    // two-word nickname could never match even when heard correctly). Still
-    // prefix-friendly: "sam" still matches inside "samsung" if misheard.
+    // two-word nickname could never match even when heard correctly).
+    // For multi-word phrases specifically, each individual word is allowed
+    // to appear once or twice in a row — speech recognition sometimes
+    // stutters a quickly-repeated phrase into an extra duplicated word
+    // (e.g. "my man" heard as "my my man"). Single-word phrases are
+    // matched exactly as before (unchanged) — collapsing repeats there
+    // would break the intentional "say it twice" trigger itself.
+    const escapeRegex = s => s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
     const countMatches = (text, phrase) => {
       if(!phrase) return 0;
-      const escaped = phrase.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
-      const re = new RegExp('\\b' + escaped, 'g');
+      const words = phrase.split(/\s+/).filter(Boolean);
+      let pattern;
+      if(words.length <= 1){
+        pattern = '\\b' + escapeRegex(phrase);
+      } else {
+        const lastWord = words[words.length - 1];
+        pattern = '\\b' + words.slice(0, -1).map(w => `(?:${escapeRegex(w)}\\s+){1,2}`).join('') + `(?:${escapeRegex(lastWord)}){1,2}`;
+      }
+      const re = new RegExp(pattern, 'g');
       const matches = text.match(re);
       return matches ? matches.length : 0;
     };
@@ -1252,7 +1265,7 @@ class HushiApp {
   // ---------- wake word wiring ----------
   _startWake(){
     if(this.wakeListener) this.wakeListener.stop(); // cheap safety net against any leftover mic instance
-    this.wakeListener = new WakeWordListener([this.state.partnerNick, 'alo', 'allo']);
+    this.wakeListener = new WakeWordListener([this.state.partnerNick, 'alo', 'allo', 'hello', 'hallo']);
     this._wakeLog = [];
     this.$('wake-note').textContent = `Say "${this.state.partnerNick} ${this.state.partnerNick}" or "Alo Alo" to call, hands-free.`;
     this.wakeListener.on('wake', () => this._toggleCall());
@@ -1309,18 +1322,3 @@ class HushiApp {
     if(this._resumeWakeAfterCall){
       this._resumeWakeAfterCall = false;
       this._startWake();
-    }
-  }
-
-  // ---------- "bye bye" to hang up, active only during a live call ----------
-  // Requires the doubled phrase, same pattern as the wake word — a single
-  // "bye" (e.g. "by the way") won't trigger it, only "bye bye" will.
-  _startByeListener(){
-    this._pauseWakeForCall(); // idempotent — already paused if a call was starting
-    this.byeListener = new WakeWordListener('bye');
-    const baseHint = 'talking with ' + this.state.partnerName + ' — say "bye bye" or tap to end';
-    this.byeListener.on('wake', () => this._toggleCall()); // call is live, so this hangs up
-    this.byeListener.on('mic-live', () => {
-      this.$('conn-state').textContent = '🟢 ' + baseHint;
-    });
-    this.byeListener.o
