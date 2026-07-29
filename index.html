@@ -375,7 +375,26 @@ class PeerJSTransport extends Emitter {
 
     const attempt = () => {
       if(this.dataConn && this.dataConn.open) return; // already know they're online
-      const conn = this.peer.connect(peerId, { reliable: true });
+      if(!this.peer || this.peer.destroyed){
+        // Not ready yet (or was just torn down mid-reconnect) — quietly
+        // wait for the next scheduled attempt instead of crashing.
+        this.emit('presence-offline');
+        return;
+      }
+      let conn;
+      try{
+        conn = this.peer.connect(peerId, { reliable: true });
+      }catch(e){
+        this.emit('presence-offline');
+        return;
+      }
+      if(!conn){
+        // PeerJS can occasionally return nothing (e.g. right after a
+        // destroy/reconnect cycle) — treat it the same as any other
+        // failed attempt rather than crashing on the next line.
+        this.emit('presence-offline');
+        return;
+      }
       let settled = false;
       const failTimer = setTimeout(() => {
         if(!settled){ settled = true; this.emit('presence-offline'); }
@@ -407,13 +426,17 @@ class PeerJSTransport extends Emitter {
     navigator.mediaDevices.getUserMedia({ audio: true }).then(stream => {
       this._micStream = stream;
       this.currentCall = this.peer.call(peerId, stream);
+      if(!this.currentCall){ this.emit('error', "couldn't start the call — try again"); this.emit('call-ended'); return; }
       this.currentCall.on('stream', rs => { this._attachRemote(rs); this.emit('call-connected'); this._startSilenceWatcher(); });
       this.currentCall.on('close', () => this.emit('call-ended'));
       this.currentCall.on('error', () => this.emit('call-ended'));
 
       if(!this.dataConn){
-        this.dataConn = this.peer.connect(peerId);
-        this.dataConn.on('data', payload => this.emit('data', payload));
+        const dc = this.peer.connect(peerId);
+        if(dc){
+          this.dataConn = dc;
+          this.dataConn.on('data', payload => this.emit('data', payload));
+        }
       }
     }).catch(() => {
       this.emit('error', 'microphone permission is needed to talk');
@@ -432,6 +455,7 @@ class PeerJSTransport extends Emitter {
       this._micStream = stream;
       this.currentCall = this.peer.call(peerId, stream, { metadata: { warm: true } });
       this._warmingUp = false;
+      if(!this.currentCall) return; // couldn't establish it this round — a later presence check will retry
 
       this.currentCall.on('stream', rs => {
         this._remoteStream = rs;
@@ -443,8 +467,11 @@ class PeerJSTransport extends Emitter {
       this.currentCall.on('error', () => { this._warm = false; this.currentCall = null; });
 
       if(!this.dataConn){
-        this.dataConn = this.peer.connect(peerId);
-        this.dataConn.on('data', payload => this.emit('data', payload));
+        const dc = this.peer.connect(peerId);
+        if(dc){
+          this.dataConn = dc;
+          this.dataConn.on('data', payload => this.emit('data', payload));
+        }
       }
     }).catch(() => { this._warmingUp = false; });
   }
@@ -490,6 +517,7 @@ class PeerJSTransport extends Emitter {
       this.dataConn.on('open', () => this.dataConn.send(payload));
     } else if(this.peer && this.partnerId){
       const c = this.peer.connect(this.partnerId);
+      if(!c) return; // couldn't establish it this round — silently drop rather than crash
       c.on('open', () => c.send(payload));
       c.on('data', p => this.emit('data', p));
       this.dataConn = c;
@@ -1322,3 +1350,170 @@ class HushiApp {
     if(this._resumeWakeAfterCall){
       this._resumeWakeAfterCall = false;
       this._startWake();
+    }
+  }
+
+  // ---------- "bye bye" to hang up, active only during a live call ----------
+  // Requires the doubled phrase, same pattern as the wake word — a single
+  // "bye" (e.g. "by the way") won't trigger it, only "bye bye" will.
+  _startByeListener(){
+    this._pauseWakeForCall(); // idempotent — already paused if a call was starting
+    this.byeListener = new WakeWordListener('bye');
+    const baseHint = 'talking with ' + this.state.partnerName + ' — say "bye bye" or tap to end';
+    this.byeListener.on('wake', () => this._toggleCall()); // call is live, so this hangs up
+    this.byeListener.on('mic-live', () => {
+      this.$('conn-state').textContent = '🟢 ' + baseHint;
+    });
+    this.byeListener.on('mic-idle', () => {
+      this.$('conn-state').textContent = '⚪ (restarting mic) ' + baseHint;
+    });
+    this.byeListener.on('heard', (transcript) => {
+      if(transcript) this.$('conn-state').textContent = `🟢 heard: "${transcript}" — ` + baseHint;
+    });
+    this.byeListener.on('error', (reason) => {
+      this.$('conn-state').textContent = `⚪ mic issue: ${reason} — ` + baseHint;
+    });
+    this.byeListener.on('unsupported', () => {}); // no support — button still works, fail quietly
+    this.byeListener.start();
+  }
+
+  _stopByeListener(){
+    if(this.byeListener) this.byeListener.stop();
+    this.byeListener = null;
+    this._resumeWakeIfNeeded();
+  }
+
+  // ---------- shared call toggle: button, wake word, and earbuds all use this ----------
+  _toggleCall(){
+    const btn = this.$('big-btn');
+    if(btn.classList.contains('live') || btn.classList.contains('calling')){
+      if(this._callRetryTimer){ clearTimeout(this._callRetryTimer); this._callRetryTimer = null; }
+      this._callRetryDeadline = null;
+      if(this.transport._warm){
+        // Soft-close — keeps the connection alive muted, so next time is instant too.
+        this.transport.closeWarmChannel();
+        this._setLiveUI(false);
+        this._stopByeListener();
+        this._stopCallProtection();
+      } else {
+        this.transport.hangUp();
+      }
+    } else if(this.transport._warm && this.transport.currentCall){
+      // Already warm and connected — this is the fast path, no negotiation needed.
+      this._pauseWakeForCall();
+      this.transport.openWarmChannel();
+      this._callConnectedThisAttempt = true;
+      this._setLiveUI(true);
+      setTimeout(() => { if(this.callActive) this._startByeListener(); }, 600);
+      this._startCallProtection();
+      this._placeNativeCallIfAvailable();
+    } else {
+      // Not warm yet (e.g. they were fully closed and just auto-launched) —
+      // fall back to the full negotiation path, same as always.
+      this._pauseWakeForCall();
+      this._setLiveUI('calling');
+      this._callConnectedThisAttempt = false;
+      this._callRetryDeadline = Date.now() + 60000; // 60s — realistically covers push delivery, noticing + tapping the notification, and a full cold app launch
+      this.transport.callPeer(this.state.partnerCode);
+      this._placeNativeCallIfAvailable();
+      fetch(PUSH_SERVER_URL + '/notify', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ code: this.state.partnerCode, callerName: this.state.myName })
+      }).catch(() => {}); // best-effort — never let a push failure block the actual call
+    }
+  }
+
+  // Best-effort — places a real native "call" so our own outgoing line gets
+  // proper system integration too. Silently does nothing if the calling
+  // account isn't registered/enabled yet, or on plain web.
+  _placeNativeCallIfAvailable(){
+    try{
+      const isNativeApp = !!(window.Capacitor && window.Capacitor.isNativePlatform && window.Capacitor.isNativePlatform());
+      if(!isNativeApp || !window.Capacitor.Plugins.CallForeground) return;
+      window.Capacitor.Plugins.CallForeground.placeNativeCall().catch(() => {});
+    }catch(e){ /* fine — the call itself still works without this */ }
+  }
+
+  // ---------- earbud button presses (e.g. double-tap) as a main calling trigger ----------
+  // This needs a "live" (even if silent) audio element for the OS to route
+  // hardware media-button presses to this page at all. Different earbuds map
+  // their gesture to different signals, so we treat several as equivalent.
+  _startEarbudTrigger(){
+    if(!('mediaSession' in navigator)) return;
+
+    navigator.mediaSession.metadata = new MediaMetadata({
+      title: this.state.partnerName || 'Bondiez',
+      artist: 'Bondiez'
+    });
+
+    const trigger = () => this._toggleCall();
+    ['play', 'pause', 'nexttrack', 'previoustrack'].forEach(action => {
+      try { navigator.mediaSession.setActionHandler(action, trigger); }
+      catch(e) { /* some browsers don't support every action type — skip it */ }
+    });
+
+    const audio = this.$('keepalive-audio');
+    audio.volume = 0.01;
+    const tryPlay = () => audio.play().catch(() => {});
+    tryPlay();
+    // Autoplay is often blocked until a real user gesture happens —
+    // this catches the first tap anywhere and retries once.
+    document.addEventListener('click', tryPlay, { once: true });
+  }
+
+  // ---------- status helpers ----------
+  _showAlert(text){
+    const b = this.$('alert-banner');
+    b.textContent = text;
+    b.style.display = 'block';
+    setTimeout(() => { b.style.display = 'none'; }, 12000);
+  }
+
+  _updateNetworkStatus(){
+    const online = navigator.onLine;
+    this.$('net-dot').className = 'dot ' + (online ? 'ok' : 'warn');
+    this.$('net-text').textContent = online ? 'online' : 'offline';
+  }
+
+  async _updateBattery(){
+    try{
+      if(navigator.getBattery){
+        const b = await navigator.getBattery();
+        const render = () => this.$('battery-text').textContent = Math.round(b.level * 100) + '%' + (b.charging ? ' ⚡' : '');
+        render();
+        b.addEventListener('levelchange', render);
+        b.addEventListener('chargingchange', render);
+      }
+    }catch(e){ /* battery api unavailable, skip silently */ }
+  }
+}
+
+// Turns any uncaught crash into a visible message instead of a silent
+// blank/black screen — genuinely useful safety net, cheap to have.
+// Only the FIRST one gets shown — once the page is wiped to display an
+// error, later code trying to touch now-gone elements would throw its own
+// unrelated error, which used to overwrite and hide the real original one.
+let _bondiezErrorShown = false;
+window.onerror = function(message, source, line, col, error){
+  if(_bondiezErrorShown) return;
+  _bondiezErrorShown = true;
+  document.body.innerHTML = `<div style="color:#f3ece7;background:#0d0b10;padding:20px;font-family:sans-serif;line-height:1.6;">
+    <b>Bondiez hit an error:</b><br>${message}<br>Line: ${line}
+  </div>`;
+};
+
+try {
+  new HushiApp();
+} catch(e) {
+  if(!_bondiezErrorShown){
+    _bondiezErrorShown = true;
+    document.body.innerHTML = `<div style="color:#f3ece7;background:#0d0b10;padding:20px;font-family:sans-serif;line-height:1.6;">
+      <b>Bondiez crashed on startup:</b><br>${e.message}
+    </div>`;
+  }
+  console.error(e);
+}
+</script>
+</body>
+</html>
