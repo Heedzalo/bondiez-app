@@ -630,7 +630,11 @@ class WakeWordListener extends Emitter {
       this.emit('heard', windowText);
       if(this.phrases.some(p => countMatches(words, p) >= 2)) this.emit('wake');
     };
-    this.recognition.onstart = () => { this._lastActivityAt = Date.now(); };
+    this.recognition.onstart = () => {
+      this._lastActivityAt = Date.now();
+      this._restartCount = (this._restartCount || 0) + 1;
+      this.emit('restart', this._restartCount);
+    };
     this.recognition.onaudiostart = () => { this._lastActivityAt = Date.now(); this.emit('mic-live'); };
     this.recognition.onaudioend = () => {
       this.emit('mic-idle');
@@ -883,10 +887,12 @@ class HushiApp {
     this.$('big-btn').addEventListener('click', () => this._toggleCall());
 
     this.$('wake-toggle').addEventListener('change', e => {
+      Storage.set('bondiez_wake_enabled', e.target.checked);
       if(e.target.checked) this._startWake(); else this._stopWake();
     });
 
     this.$('cry-toggle').addEventListener('change', e => {
+      Storage.set('bondiez_cry_enabled', e.target.checked);
       if(e.target.checked){
         this.distressDetector.start();
       } else {
@@ -916,6 +922,17 @@ class HushiApp {
     try{ this._wireVisibilityRecovery(); }catch(e){ console.warn('visibility recovery setup failed:', e); }
     this._checkEarbudLaunchTrigger();
     this._checkNativeAnswerTrigger();
+
+    // Restore whatever the toggles were set to last time, instead of always
+    // resetting to off on every fresh open.
+    if(Storage.get('bondiez_wake_enabled')){
+      this.$('wake-toggle').checked = true;
+      this._startWake();
+    }
+    if(Storage.get('bondiez_cry_enabled')){
+      this.$('cry-toggle').checked = true;
+      this.distressDetector.start();
+    }
   }
 
   // ---------- was this app-open caused by an earbud double-tap while fully closed? ----------
@@ -1216,6 +1233,12 @@ class HushiApp {
     this.wakeListener = new WakeWordListener([this.state.partnerNick, 'alo', 'allo']);
     const baseHint = `Say "${this.state.partnerNick} ${this.state.partnerNick}" or "Alo Alo" to call, hands-free.`;
     this.wakeListener.on('wake', () => this._toggleCall());
+    this.wakeListener.on('restart', (count) => {
+      this._wakeRestartCount = count;
+      // A big number climbing fast = genuine restart-cycling, visible proof
+      // instead of a guess. A number holding steady = it's working normally.
+      this.$('wake-note').textContent = `🔁 restarts: ${count} — ` + baseHint;
+    });
     this.wakeListener.on('listening', () => {
       this.$('wake-note').textContent = baseHint + ' (listening…)';
     });
@@ -1395,7 +1418,13 @@ class HushiApp {
 
 // Turns any uncaught crash into a visible message instead of a silent
 // blank/black screen — genuinely useful safety net, cheap to have.
+// Only the FIRST one gets shown — once the page is wiped to display an
+// error, later code trying to touch now-gone elements would throw its own
+// unrelated error, which used to overwrite and hide the real original one.
+let _bondiezErrorShown = false;
 window.onerror = function(message, source, line, col, error){
+  if(_bondiezErrorShown) return;
+  _bondiezErrorShown = true;
   document.body.innerHTML = `<div style="color:#f3ece7;background:#0d0b10;padding:20px;font-family:sans-serif;line-height:1.6;">
     <b>Bondiez hit an error:</b><br>${message}<br>Line: ${line}
   </div>`;
@@ -1404,9 +1433,12 @@ window.onerror = function(message, source, line, col, error){
 try {
   new HushiApp();
 } catch(e) {
-  document.body.innerHTML = `<div style="color:#f3ece7;background:#0d0b10;padding:20px;font-family:sans-serif;line-height:1.6;">
-    <b>Bondiez crashed on startup:</b><br>${e.message}
-  </div>`;
+  if(!_bondiezErrorShown){
+    _bondiezErrorShown = true;
+    document.body.innerHTML = `<div style="color:#f3ece7;background:#0d0b10;padding:20px;font-family:sans-serif;line-height:1.6;">
+      <b>Bondiez crashed on startup:</b><br>${e.message}
+    </div>`;
+  }
   console.error(e);
 }
 </script>
