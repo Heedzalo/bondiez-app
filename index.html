@@ -85,6 +85,7 @@
   .toggle-row{ display:flex; align-items:center; justify-content:space-between; background:var(--bg-soft); border:1px solid var(--line); border-radius:14px; padding:12px 14px; }
   .toggle-row .label{ font-size:13px; }
   .toggle-row .note{ font-size:11px; color:var(--text-dim); margin-top:2px; max-width:250px;}
+  #wake-note{ max-height:90px; overflow-y:auto; white-space:pre-line; display:block; }
   .switch{ position:relative; width:44px; height:26px; flex-shrink:0;}
   .switch input{ opacity:0; width:0; height:0;}
   .slider{ position:absolute; inset:0; background:#3a323a; border-radius:20px; cursor:pointer; transition:.2s;}
@@ -602,12 +603,16 @@ class WakeWordListener extends Emitter {
     this._lastActivityAt = Date.now();
     const WINDOW_MS = 6000;
 
-    // Whole-word match, or the heard word STARTS WITH the phrase — this is
-    // deliberate: short names commonly get misheard as a longer, more
-    // "expected" word (e.g. "Sam" heard as "Samsung" on a Samsung phone).
-    // A prefix match still counts, since the intended word was said.
-    const countMatches = (words, phrase) => {
-      return words.filter(w => w === phrase || (phrase.length >= 3 && w.startsWith(phrase))).length;
+    // Matches the phrase as a whole — handles multi-word nicknames like "my
+    // man" correctly (the old version only ever checked single words, so a
+    // two-word nickname could never match even when heard correctly). Still
+    // prefix-friendly: "sam" still matches inside "samsung" if misheard.
+    const countMatches = (text, phrase) => {
+      if(!phrase) return 0;
+      const escaped = phrase.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+      const re = new RegExp('\\b' + escaped, 'g');
+      const matches = text.match(re);
+      return matches ? matches.length : 0;
     };
 
     this.recognition.onresult = (event) => {
@@ -625,10 +630,9 @@ class WakeWordListener extends Emitter {
       }
       this._recentFinals = this._recentFinals.filter(e => now - e.time < WINDOW_MS);
       const windowText = (this._recentFinals.map(e => e.text).join(' ') + ' ' + interim).trim();
-      const words = windowText.split(/\s+/).filter(Boolean);
 
       this.emit('heard', windowText);
-      if(this.phrases.some(p => countMatches(words, p) >= 2)) this.emit('wake');
+      if(this.phrases.some(p => countMatches(windowText, p) >= 2)) this.emit('wake');
     };
     this.recognition.onstart = () => {
       this._lastActivityAt = Date.now();
@@ -660,8 +664,12 @@ class WakeWordListener extends Emitter {
         this.recognition.start();
       }
     };
-    this.recognition.start();
-    this.emit('listening');
+    try{
+      this.recognition.start();
+      this.emit('listening');
+    }catch(e){
+      this.emit('error', 'failed to start: ' + e.message);
+    }
 
     // Backstop watchdog: covers the rare case where even onaudioend never
     // fires. Short window now — a restart during real silence costs
@@ -1245,28 +1253,27 @@ class HushiApp {
   _startWake(){
     if(this.wakeListener) this.wakeListener.stop(); // cheap safety net against any leftover mic instance
     this.wakeListener = new WakeWordListener([this.state.partnerNick, 'alo', 'allo']);
-    const baseHint = `Say "${this.state.partnerNick} ${this.state.partnerNick}" or "Alo Alo" to call, hands-free.`;
+    this._wakeLog = [];
+    this.$('wake-note').textContent = `Say "${this.state.partnerNick} ${this.state.partnerNick}" or "Alo Alo" to call, hands-free.`;
     this.wakeListener.on('wake', () => this._toggleCall());
     this.wakeListener.on('restart', (count) => {
       this._wakeRestartCount = count;
-      // A big number climbing fast = genuine restart-cycling, visible proof
-      // instead of a guess. A number holding steady = it's working normally.
-      this.$('wake-note').textContent = `🔁 restarts: ${count} — ` + baseHint;
+      this._logWake(`🔁 restart #${count}`);
     });
     this.wakeListener.on('listening', () => {
-      this.$('wake-note').textContent = baseHint + ' (listening…)';
+      this._logWake('listening…');
     });
     this.wakeListener.on('mic-live', () => {
-      this.$('wake-note').textContent = '🟢 mic live — ' + baseHint;
+      this._logWake('🟢 mic live');
     });
     this.wakeListener.on('mic-idle', () => {
-      this.$('wake-note').textContent = '⚪ mic idle, restarting — ' + baseHint;
+      this._logWake('⚪ mic idle');
     });
     this.wakeListener.on('heard', (transcript) => {
-      if(transcript) this.$('wake-note').textContent = `🟢 heard: "${transcript}" — ` + baseHint;
+      if(transcript) this._logWake(`heard: "${transcript}"`);
     });
     this.wakeListener.on('error', (reason) => {
-      this.$('wake-note').textContent = `⚪ mic issue: ${reason}, retrying — ` + baseHint;
+      this._logWake(`⚠️ mic issue: ${reason}`);
     });
     this.wakeListener.on('unsupported', () => {
       alert('Wake phrase listening needs Chrome on Android (or desktop Chrome). This browser doesn\'t support it — use the big button instead.');
@@ -1277,6 +1284,17 @@ class HushiApp {
 
   _stopWake(){
     if(this.wakeListener) this.wakeListener.stop();
+  }
+
+  // Appends a timestamped line to a scrollable log instead of overwriting a
+  // single line — lets you calmly scroll back through exactly what happened,
+  // instead of needing to catch something changing too fast to read.
+  _logWake(line){
+    if(!this._wakeLog) this._wakeLog = [];
+    const t = new Date().toLocaleTimeString([], { minute:'2-digit', second:'2-digit' });
+    this._wakeLog.unshift(`[${t}] ${line}`);
+    if(this._wakeLog.length > 25) this._wakeLog.length = 25;
+    this.$('wake-note').textContent = this._wakeLog.join('\n');
   }
 
   // ---------- pause/resume wake listening around any call, from the earliest possible moment ----------
@@ -1305,156 +1323,4 @@ class HushiApp {
     this.byeListener.on('mic-live', () => {
       this.$('conn-state').textContent = '🟢 ' + baseHint;
     });
-    this.byeListener.on('mic-idle', () => {
-      this.$('conn-state').textContent = '⚪ (restarting mic) ' + baseHint;
-    });
-    this.byeListener.on('heard', (transcript) => {
-      if(transcript) this.$('conn-state').textContent = `🟢 heard: "${transcript}" — ` + baseHint;
-    });
-    this.byeListener.on('error', (reason) => {
-      this.$('conn-state').textContent = `⚪ mic issue: ${reason} — ` + baseHint;
-    });
-    this.byeListener.on('unsupported', () => {}); // no support — button still works, fail quietly
-    this.byeListener.start();
-  }
-
-  _stopByeListener(){
-    if(this.byeListener) this.byeListener.stop();
-    this.byeListener = null;
-    this._resumeWakeIfNeeded();
-  }
-
-  // ---------- shared call toggle: button, wake word, and earbuds all use this ----------
-  _toggleCall(){
-    const btn = this.$('big-btn');
-    if(btn.classList.contains('live') || btn.classList.contains('calling')){
-      if(this._callRetryTimer){ clearTimeout(this._callRetryTimer); this._callRetryTimer = null; }
-      this._callRetryDeadline = null;
-      if(this.transport._warm){
-        // Soft-close — keeps the connection alive muted, so next time is instant too.
-        this.transport.closeWarmChannel();
-        this._setLiveUI(false);
-        this._stopByeListener();
-        this._stopCallProtection();
-      } else {
-        this.transport.hangUp();
-      }
-    } else if(this.transport._warm && this.transport.currentCall){
-      // Already warm and connected — this is the fast path, no negotiation needed.
-      this._pauseWakeForCall();
-      this.transport.openWarmChannel();
-      this._callConnectedThisAttempt = true;
-      this._setLiveUI(true);
-      setTimeout(() => { if(this.callActive) this._startByeListener(); }, 600);
-      this._startCallProtection();
-      this._placeNativeCallIfAvailable();
-    } else {
-      // Not warm yet (e.g. they were fully closed and just auto-launched) —
-      // fall back to the full negotiation path, same as always.
-      this._pauseWakeForCall();
-      this._setLiveUI('calling');
-      this._callConnectedThisAttempt = false;
-      this._callRetryDeadline = Date.now() + 60000; // 60s — realistically covers push delivery, noticing + tapping the notification, and a full cold app launch
-      this.transport.callPeer(this.state.partnerCode);
-      this._placeNativeCallIfAvailable();
-      fetch(PUSH_SERVER_URL + '/notify', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ code: this.state.partnerCode, callerName: this.state.myName })
-      }).catch(() => {}); // best-effort — never let a push failure block the actual call
-    }
-  }
-
-  // Best-effort — places a real native "call" so our own outgoing line gets
-  // proper system integration too. Silently does nothing if the calling
-  // account isn't registered/enabled yet, or on plain web.
-  _placeNativeCallIfAvailable(){
-    try{
-      const isNativeApp = !!(window.Capacitor && window.Capacitor.isNativePlatform && window.Capacitor.isNativePlatform());
-      if(!isNativeApp || !window.Capacitor.Plugins.CallForeground) return;
-      window.Capacitor.Plugins.CallForeground.placeNativeCall().catch(() => {});
-    }catch(e){ /* fine — the call itself still works without this */ }
-  }
-
-  // ---------- earbud button presses (e.g. double-tap) as a main calling trigger ----------
-  // This needs a "live" (even if silent) audio element for the OS to route
-  // hardware media-button presses to this page at all. Different earbuds map
-  // their gesture to different signals, so we treat several as equivalent.
-  _startEarbudTrigger(){
-    if(!('mediaSession' in navigator)) return;
-
-    navigator.mediaSession.metadata = new MediaMetadata({
-      title: this.state.partnerName || 'Bondiez',
-      artist: 'Bondiez'
-    });
-
-    const trigger = () => this._toggleCall();
-    ['play', 'pause', 'nexttrack', 'previoustrack'].forEach(action => {
-      try { navigator.mediaSession.setActionHandler(action, trigger); }
-      catch(e) { /* some browsers don't support every action type — skip it */ }
-    });
-
-    const audio = this.$('keepalive-audio');
-    audio.volume = 0.01;
-    const tryPlay = () => audio.play().catch(() => {});
-    tryPlay();
-    // Autoplay is often blocked until a real user gesture happens —
-    // this catches the first tap anywhere and retries once.
-    document.addEventListener('click', tryPlay, { once: true });
-  }
-
-  // ---------- status helpers ----------
-  _showAlert(text){
-    const b = this.$('alert-banner');
-    b.textContent = text;
-    b.style.display = 'block';
-    setTimeout(() => { b.style.display = 'none'; }, 12000);
-  }
-
-  _updateNetworkStatus(){
-    const online = navigator.onLine;
-    this.$('net-dot').className = 'dot ' + (online ? 'ok' : 'warn');
-    this.$('net-text').textContent = online ? 'online' : 'offline';
-  }
-
-  async _updateBattery(){
-    try{
-      if(navigator.getBattery){
-        const b = await navigator.getBattery();
-        const render = () => this.$('battery-text').textContent = Math.round(b.level * 100) + '%' + (b.charging ? ' ⚡' : '');
-        render();
-        b.addEventListener('levelchange', render);
-        b.addEventListener('chargingchange', render);
-      }
-    }catch(e){ /* battery api unavailable, skip silently */ }
-  }
-}
-
-// Turns any uncaught crash into a visible message instead of a silent
-// blank/black screen — genuinely useful safety net, cheap to have.
-// Only the FIRST one gets shown — once the page is wiped to display an
-// error, later code trying to touch now-gone elements would throw its own
-// unrelated error, which used to overwrite and hide the real original one.
-let _bondiezErrorShown = false;
-window.onerror = function(message, source, line, col, error){
-  if(_bondiezErrorShown) return;
-  _bondiezErrorShown = true;
-  document.body.innerHTML = `<div style="color:#f3ece7;background:#0d0b10;padding:20px;font-family:sans-serif;line-height:1.6;">
-    <b>Bondiez hit an error:</b><br>${message}<br>Line: ${line}
-  </div>`;
-};
-
-try {
-  new HushiApp();
-} catch(e) {
-  if(!_bondiezErrorShown){
-    _bondiezErrorShown = true;
-    document.body.innerHTML = `<div style="color:#f3ece7;background:#0d0b10;padding:20px;font-family:sans-serif;line-height:1.6;">
-      <b>Bondiez crashed on startup:</b><br>${e.message}
-    </div>`;
-  }
-  console.error(e);
-}
-</script>
-</body>
-</html>
+    this.byeListener.o
