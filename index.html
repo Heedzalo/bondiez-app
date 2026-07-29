@@ -617,6 +617,21 @@ class WakeWordListener extends Emitter {
                               // small pause) still gets matched together
     this._lastActivityAt = 0;
     this._watchdogInterval = null;
+    this._restarting = false; // guards against overlapping stop()/start() calls — a real race that can throw InvalidStateError
+  }
+
+  // Every restart routes through here so start() is never called twice
+  // while a previous session hasn't actually finished stopping yet.
+  _safeStart(){
+    if(!this.active || this._restarting) return;
+    this._restarting = true;
+    try{
+      this.recognition.start();
+    }catch(e){
+      // "already started" / "still stopping" — harmless, the in-flight
+      // session's own onend will trigger the next real restart.
+    }
+    this._restarting = false;
   }
 
   start(){
@@ -684,11 +699,18 @@ class WakeWordListener extends Emitter {
     this.recognition.onaudiostart = () => { this._lastActivityAt = Date.now(); this.emit('mic-live'); };
     this.recognition.onaudioend = () => {
       this.emit('mic-idle');
-      if(this.active){
-        try { this.recognition.stop(); } catch(e) {}
-      }
+      // Don't call stop() here too — onend below is what restarts it.
+      // Calling stop() again on top of an already-ending session was
+      // creating the overlap that could throw InvalidStateError.
     };
-    this.recognition.onerror = (event) => { this._lastActivityAt = Date.now(); this.emit('error', event.error); };
+    this.recognition.onerror = (event) => {
+      this._lastActivityAt = Date.now();
+      // "aborted" fires every time because WE call .stop() ourselves each
+      // restart cycle — it's the browser reporting our own deliberate
+      // action, not a genuine problem, so it's not worth surfacing as an error.
+      if(event.error === 'aborted') return;
+      this.emit('error', event.error);
+    };
     this.recognition.onend = () => {
       if(!this.active) return;
       // A hard floor on restart speed — some devices' speech recognition
@@ -700,9 +722,9 @@ class WakeWordListener extends Emitter {
       const MIN_SESSION_GAP_MS = 500;
       const elapsed = Date.now() - (this._lastStartAt || 0);
       if(elapsed < MIN_SESSION_GAP_MS){
-        setTimeout(() => { if(this.active) this.recognition.start(); }, MIN_SESSION_GAP_MS - elapsed);
+        setTimeout(() => this._safeStart(), MIN_SESSION_GAP_MS - elapsed);
       } else {
-        this.recognition.start();
+        this._safeStart();
       }
     };
     try{
@@ -713,15 +735,18 @@ class WakeWordListener extends Emitter {
     }
 
     // Backstop watchdog: covers the rare case where even onaudioend never
-    // fires. Short window now — a restart during real silence costs
-    // nothing, so there's no reason to wait long to recover from a stall.
+    // fires. Only ever calls stop() directly — start() only ever happens
+    // through onend/_safeStart, so the browser's "did the previous session
+    // actually finish" state is never raced from two different places.
     if(this._watchdogInterval) clearInterval(this._watchdogInterval);
     this._watchdogInterval = setInterval(() => {
       if(!this.active) return;
       if(Date.now() - this._lastActivityAt > 4000){
         this._lastActivityAt = Date.now();
         try { this.recognition.stop(); } catch(e) {}
-        try { this.recognition.start(); } catch(e) {}
+        // Last-resort net in case onend never fires at all — _safeStart()
+        // is a no-op if a restart already happened via onend by then.
+        setTimeout(() => this._safeStart(), 800);
       }
     }, 1500);
   }
