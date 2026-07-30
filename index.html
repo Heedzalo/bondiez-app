@@ -766,7 +766,12 @@ class WakeWordListener extends Emitter {
       // never gives any single session enough time to actually catch and
       // process what was said. This guarantees every session gets at least
       // this long before the next one begins, no matter what triggered the end.
-      const MIN_SESSION_GAP_MS = 500;
+      // Raised from 500ms — 500 was still short enough on some phones to
+      // produce an audible, rapid on/off mic-restart loop (heard as a fast
+      // repeating click), both for the wake-phrase listener and the "bye
+      // bye" hang-up listener that runs during every call, since both use
+      // this same class.
+      const MIN_SESSION_GAP_MS = 1800;
       const elapsed = Date.now() - (this._lastStartAt || 0);
       if(elapsed < MIN_SESSION_GAP_MS){
         setTimeout(() => this._safeStart(), MIN_SESSION_GAP_MS - elapsed);
