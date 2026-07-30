@@ -1057,6 +1057,7 @@ class HushiApp {
     try{ this._wireVisibilityRecovery(); }catch(e){ console.warn('visibility recovery setup failed:', e); }
     this._checkEarbudLaunchTrigger();
     this._checkNativeAnswerTrigger();
+    this._checkAutoAnswerTrigger();
 
     // Restore whatever the toggles were set to last time, instead of always
     // resetting to off on every fresh open.
@@ -1088,6 +1089,20 @@ class HushiApp {
       const result = await window.Capacitor.Plugins.CallForeground.checkNativeAnswer();
       if(result && result.answered) this._toggleCall();
     }catch(e){ /* best-effort — the existing notification-based path still works regardless */ }
+  }
+
+  // ---------- was this app-open caused by a call notification, phone locked/closed? ----------
+  // This is the WhatsApp-style path: the native side already woke the screen and
+  // drew over the lock screen before this JS ever ran (see MainActivity). This
+  // check is what turns that into an actual hands-free connect — no tap needed —
+  // instead of just sitting open on the main screen waiting for one.
+  async _checkAutoAnswerTrigger(){
+    try{
+      const isNativeApp = !!(window.Capacitor && window.Capacitor.isNativePlatform && window.Capacitor.isNativePlatform());
+      if(!isNativeApp || !window.Capacitor.Plugins.CallForeground) return;
+      const result = await window.Capacitor.Plugins.CallForeground.checkAutoAnswerTrigger();
+      if(result && result.triggered) this._toggleCall();
+    }catch(e){ /* best-effort — the notification itself still opens the app either way */ }
   }
 
   // ---------- resume cleanly whenever you switch back to this tab ----------
