@@ -652,6 +652,59 @@ class PeerJSTransport extends Emitter {
    WAKE WORD LISTENER — knows nothing about calling or PeerJS.
    It only emits 'wake' when it hears the phrase twice.
    ============================================================== */
+/* ==============================================================
+   NATIVE SPEECH LISTENER — uses Android's own built-in speech
+   engine directly (not the WebView bridge), only inside the
+   installed app. Same public interface as WakeWordListener below
+   (same events, same start()/stop()/.active), so call sites don't
+   need to care which is actually running underneath.
+   ============================================================== */
+class NativeSpeechListener extends Emitter {
+  constructor(phraseOrPhrases){
+    super();
+    const list = Array.isArray(phraseOrPhrases) ? phraseOrPhrases : [phraseOrPhrases];
+    this.phrases = list.filter(Boolean).map(p => p.toLowerCase());
+    this.active = false;
+    this._listenerHandles = [];
+  }
+
+  start(){
+    const plugin = window.Capacitor && window.Capacitor.Plugins && window.Capacitor.Plugins.NativeSpeech;
+    if(!plugin){ this.emit('unsupported'); return; }
+    this.active = true;
+
+    const add = (evt, fn) => {
+      try {
+        const result = plugin.addListener(evt, fn);
+        if(result && typeof result.then === 'function'){
+          result.then(h => { if(h) this._listenerHandles.push(h); }).catch(() => {});
+        } else if(result){
+          this._listenerHandles.push(result);
+        }
+      } catch(e) { /* best effort — a missing listener shouldn't crash the app */ }
+    };
+    add('wake', () => { if(this.active) this.emit('wake'); });
+    add('heard', (data) => { if(this.active && data && data.text) this.emit('heard', data.text); });
+    add('micLive', () => { if(this.active) this.emit('mic-live'); });
+    add('micIdle', () => { if(this.active) this.emit('mic-idle'); });
+
+    plugin.start({ phrases: this.phrases })
+      .then(() => this.emit('listening'))
+      .catch(e => {
+        if(e && e.message === 'unsupported'){ this.emit('unsupported'); }
+        else { this.emit('error', e && e.message ? e.message : 'failed to start listening'); }
+      });
+  }
+
+  stop(){
+    this.active = false;
+    const plugin = window.Capacitor && window.Capacitor.Plugins && window.Capacitor.Plugins.NativeSpeech;
+    if(plugin) plugin.stop().catch(() => {});
+    this._listenerHandles.forEach(h => { try{ h.remove(); }catch(e){} });
+    this._listenerHandles = [];
+  }
+}
+
 class WakeWordListener extends Emitter {
   constructor(phraseOrPhrases){
     super();
@@ -760,24 +813,11 @@ class WakeWordListener extends Emitter {
     };
     this.recognition.onend = () => {
       if(!this.active) return;
-      // A hard floor on restart speed — some devices' speech recognition
-      // ends a session almost instantly (sometimes sub-second), and without
-      // this, restarting immediately every time creates a runaway loop that
-      // never gives any single session enough time to actually catch and
-      // process what was said. This guarantees every session gets at least
-      // this long before the next one begins, no matter what triggered the end.
-      // Raised from 500ms — 500 was still short enough on some phones to
-      // produce an audible, rapid on/off mic-restart loop (heard as a fast
-      // repeating click), both for the wake-phrase listener and the "bye
-      // bye" hang-up listener that runs during every call, since both use
-      // this same class.
-      const MIN_SESSION_GAP_MS = 1800;
-      const elapsed = Date.now() - (this._lastStartAt || 0);
-      if(elapsed < MIN_SESSION_GAP_MS){
-        setTimeout(() => this._safeStart(), MIN_SESSION_GAP_MS - elapsed);
-      } else {
-        this._safeStart();
-      }
+      // Purely event-driven — restart happens only in direct response to the
+      // session actually ending, with no artificial wait added on top and no
+      // separate timer polling in the background. A session runs exactly as
+      // long as the device lets it, then immediately picks back up.
+      this._safeStart();
     };
     try{
       this.recognition.start();
@@ -785,22 +825,6 @@ class WakeWordListener extends Emitter {
     }catch(e){
       this.emit('error', 'failed to start: ' + e.message);
     }
-
-    // Backstop watchdog: covers the rare case where even onaudioend never
-    // fires. Only ever calls stop() directly — start() only ever happens
-    // through onend/_safeStart, so the browser's "did the previous session
-    // actually finish" state is never raced from two different places.
-    if(this._watchdogInterval) clearInterval(this._watchdogInterval);
-    this._watchdogInterval = setInterval(() => {
-      if(!this.active) return;
-      if(Date.now() - this._lastActivityAt > 4000){
-        this._lastActivityAt = Date.now();
-        try { this.recognition.stop(); } catch(e) {}
-        // Last-resort net in case onend never fires at all — _safeStart()
-        // is a no-op if a restart already happened via onend by then.
-        setTimeout(() => this._safeStart(), 800);
-      }
-    }, 1500);
   }
 
   stop(){
@@ -1382,31 +1406,42 @@ class HushiApp {
     }
   }
 
+  // ---------- picks the right listener implementation ----------
+  // Native app: uses Android's own built-in speech engine directly.
+  // Plain browser (e.g. testing in Chrome): falls back to the
+  // browser's built-in speech recognition, same as before.
+  _makeWakeWordListener(phrases){
+    const isNativeApp = !!(window.Capacitor && window.Capacitor.isNativePlatform && window.Capacitor.isNativePlatform());
+    if(isNativeApp && window.Capacitor.Plugins && window.Capacitor.Plugins.NativeSpeech){
+      return new NativeSpeechListener(phrases);
+    }
+    return new WakeWordListener(phrases);
+  }
+
   // ---------- wake word wiring ----------
   _startWake(){
     if(this.wakeListener) this.wakeListener.stop(); // cheap safety net against any leftover mic instance
-    this.wakeListener = new WakeWordListener([this.state.partnerNick, 'alo', 'allo', 'hello', 'hallo']);
+    this.wakeListener = this._makeWakeWordListener([this.state.partnerNick, 'alo', 'allo', 'hello', 'hallo']);
     this._wakeLog = [];
     this.$('wake-note').textContent = `Say "${this.state.partnerNick} ${this.state.partnerNick}" or "Alo Alo" to call, hands-free.`;
     this.wakeListener.on('wake', () => this._toggleCall());
     this.wakeListener.on('restart', (count) => {
-      this._wakeRestartCount = count;
-      this._logWake(`🔁 restart #${count}`);
+      console.log(`🔁 wake listener restart #${count}`);
     });
     this.wakeListener.on('listening', () => {
-      this._logWake('listening…');
+      console.log('wake listener: listening…');
     });
     this.wakeListener.on('mic-live', () => {
-      this._logWake('🟢 mic live');
+      console.log('wake listener: 🟢 mic live');
     });
     this.wakeListener.on('mic-idle', () => {
-      this._logWake('⚪ mic idle');
+      console.log('wake listener: ⚪ mic idle');
     });
     this.wakeListener.on('heard', (transcript) => {
-      if(transcript) this._logWake(`heard: "${transcript}"`);
+      if(transcript) console.log(`wake listener heard: "${transcript}"`);
     });
     this.wakeListener.on('error', (reason) => {
-      this._logWake(`⚠️ mic issue: ${reason}`);
+      console.warn(`wake listener mic issue: ${reason}`);
     });
     this.wakeListener.on('unsupported', () => {
       alert('Wake phrase listening needs Chrome on Android (or desktop Chrome). This browser doesn\'t support it — use the big button instead.');
@@ -1450,20 +1485,21 @@ class HushiApp {
   // "bye" (e.g. "by the way") won't trigger it, only "bye bye" will.
   _startByeListener(){
     this._pauseWakeForCall(); // idempotent — already paused if a call was starting
-    this.byeListener = new WakeWordListener('bye');
+    this.byeListener = this._makeWakeWordListener('bye');
     const baseHint = 'talking with ' + this.state.partnerName + ' — say "bye bye" or tap to end';
+    this.$('conn-state').textContent = baseHint;
     this.byeListener.on('wake', () => this._toggleCall()); // call is live, so this hangs up
     this.byeListener.on('mic-live', () => {
-      this.$('conn-state').textContent = '🟢 ' + baseHint;
+      console.log('bye listener: 🟢 mic live');
     });
     this.byeListener.on('mic-idle', () => {
-      this.$('conn-state').textContent = '⚪ (restarting mic) ' + baseHint;
+      console.log('bye listener: ⚪ mic idle');
     });
     this.byeListener.on('heard', (transcript) => {
-      if(transcript) this.$('conn-state').textContent = `🟢 heard: "${transcript}" — ` + baseHint;
+      if(transcript) console.log(`bye listener heard: "${transcript}"`);
     });
     this.byeListener.on('error', (reason) => {
-      this.$('conn-state').textContent = `⚪ mic issue: ${reason} — ` + baseHint;
+      console.warn(`bye listener mic issue: ${reason}`);
     });
     this.byeListener.on('unsupported', () => {}); // no support — button still works, fail quietly
     this.byeListener.start();
