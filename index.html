@@ -652,68 +652,6 @@ class PeerJSTransport extends Emitter {
    WAKE WORD LISTENER — knows nothing about calling or PeerJS.
    It only emits 'wake' when it hears the phrase twice.
    ============================================================== */
-/* ==============================================================
-   NATIVE VOSK WAKE WORD LISTENER — used only inside the installed
-   Android app, never in a plain browser tab. Same public interface
-   as WakeWordListener below (same events, same start()/stop()/
-   .active), so every call site can use either one interchangeably
-   without caring which is actually running underneath. This one
-   runs fully offline via Vosk (free, no account, no restarts every
-   few seconds) instead of the browser's session-based recognition.
-   ============================================================== */
-class NativeVoskWakeWordListener extends Emitter {
-  constructor(phraseOrPhrases){
-    super();
-    const list = Array.isArray(phraseOrPhrases) ? phraseOrPhrases : [phraseOrPhrases];
-    this.phrases = list.filter(Boolean).map(p => p.toLowerCase());
-    this.active = false;
-    this._listenerHandles = [];
-  }
-
-  start(){
-    const plugin = window.Capacitor && window.Capacitor.Plugins && window.Capacitor.Plugins.VoskWakeWord;
-    if(!plugin){ this.emit('unsupported'); return; }
-    this.active = true;
-
-    // addListener's return shape isn't consistent across Capacitor bridge
-    // versions — some return a Promise<handle>, others return the handle
-    // directly. Handling both defensively is what actually crashed the app
-    // before (assuming .then() always exists).
-    const add = (evt, fn) => {
-      try {
-        const result = plugin.addListener(evt, fn);
-        if(result && typeof result.then === 'function'){
-          result.then(h => { if(h) this._listenerHandles.push(h); }).catch(() => {});
-        } else if(result){
-          this._listenerHandles.push(result);
-        }
-      } catch(e) { /* best effort — a missing listener shouldn't crash the app */ }
-    };
-    add('wake', () => { if(this.active) this.emit('wake'); });
-    add('heard', (data) => { if(this.active && data && data.text) this.emit('heard', data.text); });
-    add('micLive', () => { if(this.active) this.emit('mic-live'); });
-    add('micIdle', () => { if(this.active) this.emit('mic-idle'); });
-    add('error', (data) => { if(this.active) this.emit('error', (data && data.message) || 'unknown mic issue'); });
-
-    plugin.start({ phrases: this.phrases })
-      .then(() => this.emit('listening'))
-      .catch(e => this.emit('error', e && e.message ? e.message : 'failed to start listening'));
-  }
-
-  stop(){
-    this.active = false;
-    const plugin = window.Capacitor && window.Capacitor.Plugins && window.Capacitor.Plugins.VoskWakeWord;
-    if(plugin) plugin.stop().catch(() => {});
-    this._listenerHandles.forEach(h => { try{ h.remove(); }catch(e){} });
-    this._listenerHandles = [];
-  }
-}
-
-/* ==============================================================
-   BROWSER WAKE WORD LISTENER — fallback for plain web/Chrome
-   testing (no native Vosk plugin available there). Same interface
-   as above.
-   ============================================================== */
 class WakeWordListener extends Emitter {
   constructor(phraseOrPhrases){
     super();
@@ -1444,22 +1382,10 @@ class HushiApp {
     }
   }
 
-  // ---------- picks the right listener implementation ----------
-  // Native app: uses the free, offline, no-restart Vosk plugin.
-  // Plain browser (e.g. testing in Chrome): falls back to the
-  // browser's built-in speech recognition, same as before.
-  _makeWakeWordListener(phrases){
-    const isNativeApp = !!(window.Capacitor && window.Capacitor.isNativePlatform && window.Capacitor.isNativePlatform());
-    if(isNativeApp && window.Capacitor.Plugins && window.Capacitor.Plugins.VoskWakeWord){
-      return new NativeVoskWakeWordListener(phrases);
-    }
-    return new WakeWordListener(phrases);
-  }
-
   // ---------- wake word wiring ----------
   _startWake(){
     if(this.wakeListener) this.wakeListener.stop(); // cheap safety net against any leftover mic instance
-    this.wakeListener = this._makeWakeWordListener([this.state.partnerNick, 'alo', 'allo', 'hello', 'hallo']);
+    this.wakeListener = new WakeWordListener([this.state.partnerNick, 'alo', 'allo', 'hello', 'hallo']);
     this._wakeLog = [];
     this.$('wake-note').textContent = `Say "${this.state.partnerNick} ${this.state.partnerNick}" or "Alo Alo" to call, hands-free.`;
     this.wakeListener.on('wake', () => this._toggleCall());
@@ -1524,7 +1450,7 @@ class HushiApp {
   // "bye" (e.g. "by the way") won't trigger it, only "bye bye" will.
   _startByeListener(){
     this._pauseWakeForCall(); // idempotent — already paused if a call was starting
-    this.byeListener = this._makeWakeWordListener('bye');
+    this.byeListener = new WakeWordListener('bye');
     const baseHint = 'talking with ' + this.state.partnerName + ' — say "bye bye" or tap to end';
     this.byeListener.on('wake', () => this._toggleCall()); // call is live, so this hangs up
     this.byeListener.on('mic-live', () => {
