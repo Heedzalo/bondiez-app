@@ -675,7 +675,20 @@ class NativeVoskWakeWordListener extends Emitter {
     if(!plugin){ this.emit('unsupported'); return; }
     this.active = true;
 
-    const add = (evt, fn) => { plugin.addListener(evt, fn).then(h => this._listenerHandles.push(h)); };
+    // addListener's return shape isn't consistent across Capacitor bridge
+    // versions — some return a Promise<handle>, others return the handle
+    // directly. Handling both defensively is what actually crashed the app
+    // before (assuming .then() always exists).
+    const add = (evt, fn) => {
+      try {
+        const result = plugin.addListener(evt, fn);
+        if(result && typeof result.then === 'function'){
+          result.then(h => { if(h) this._listenerHandles.push(h); }).catch(() => {});
+        } else if(result){
+          this._listenerHandles.push(result);
+        }
+      } catch(e) { /* best effort — a missing listener shouldn't crash the app */ }
+    };
     add('wake', () => { if(this.active) this.emit('wake'); });
     add('heard', (data) => { if(this.active && data && data.text) this.emit('heard', data.text); });
     add('micLive', () => { if(this.active) this.emit('mic-live'); });
